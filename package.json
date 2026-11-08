@@ -1,0 +1,31 @@
+{
+  "name": "@sheurich/pi-a2a",
+  "version": "0.1.0",
+  "description": "Pi extension for discovering and communicating with A2A-compatible agents over JSON-RPC 2.0 and Server-Sent Events.",
+  "type": "module",
+  "main": "./src/extension.mjs",
+  "types": "./src/extension.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/extension.d.ts",
+      "default": "./src/extension.mjs"
+    },
+    "./client": "./src/client.mjs",
+    "./headers-helper": "./src/headers-helper.mjs",
+    "./extension": "./src/extension.mjs"
+  },
+  "files": [
+    "src/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/a2a.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "pi": {
+    "extension": "./src/extension.mjs"
+  }
+}
