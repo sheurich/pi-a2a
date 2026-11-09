@@ -968,3 +968,69 @@ it("sendMessage and discoverAgents enforce pinnedOrigin and a2a_get_file encodes
   assert.equal(res.details.encoding, "base64");
   assert.match(res.content[0].text, /\/w==/);
 });
+
+
+it("discoverAgents isolates invalid directory entries without failing valid agents", async () => {
+  const res = await discoverAgents({
+    baseUrl: "https://agents.example.com",
+    fetchImpl: async (input) => {
+      const u = String(input);
+      if (u.endsWith("/.well-known/agent.json") && !u.includes("/a2a/")) {
+        return new Response(JSON.stringify({ name: "Root", url: "/a2a" }), { status: 200 });
+      }
+      if (u.endsWith("/a2a")) {
+        return new Response(JSON.stringify({ agents: [{ name: "Legacy_Agent" }, { name: "pgm" }] }), { status: 200 });
+      }
+      if (u.endsWith("/a2a/pgm/.well-known/agent.json")) {
+        return new Response(JSON.stringify({ name: "PGM", url: "/a2a/pgm" }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  assert.equal(res.agents.length, 2);
+  assert.ok(res.errors.some((e) => e.includes("Legacy_Agent")));
+});
+
+it("a2a_send_file rejects malformed base64 and a2a_get_file preserves UTF-8 BOM", async () => {
+  const bomBytes = Uint8Array.from([0xef, 0xbb, 0xbf, 0x68, 0x69]);
+  const tools = new Map();
+  registerPiA2aExtension(
+    {
+      registerTool(def) {
+        tools.set(def.name, def);
+      },
+    },
+    {
+      env: { PI_A2A_URL: "https://agents.example.com" },
+      fetchImpl: async () =>
+        new Response(bomBytes, {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        }),
+    },
+  );
+  const badUpload = await tools.get("a2a_send_file").execute("c1", {
+    task_id: "t1",
+    name: "bad.bin",
+    content: "aGVsbG8=THIS_IS_NOT_THE_END",
+    encoding: "base64",
+  });
+  assert.equal(badUpload.isError, true);
+
+  const bomRes = await tools.get("a2a_get_file").execute("c2", {
+    task_id: "t1",
+    name: "bom.txt",
+  });
+  assert.equal(bomRes.details.encoding, "utf8");
+  const bodyText = bomRes.content[0].text.split("\n\n")[1];
+  assert.deepEqual(Buffer.from(bodyText, "utf8"), Buffer.from(bomBytes));
+
+  const large8Mb = Buffer.alloc(8 * 1024 * 1024, 255).toString("base64");
+  const okLarge = await tools.get("a2a_send_file").execute("c3", {
+    task_id: "t1",
+    name: "large.bin",
+    content: large8Mb,
+    encoding: "base64",
+  });
+  assert.equal(okLarge.isError, undefined);
+});

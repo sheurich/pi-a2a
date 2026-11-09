@@ -782,10 +782,24 @@ export async function discoverAgents(options) {
     errors.push(`directory: ${directoryResult.reason?.message ?? String(directoryResult.reason)}`);
   }
 
-  const cardResults = await Promise.allSettled(
-    directory.map(async (entry) => {
+  /** @type {Array<{ entry: { name: string; description?: string; url?: string }; name: string; cardUrl: URL }>} */
+  const validDirectory = [];
+  for (const entry of directory) {
+    try {
       const name = normalizeAgent(entry.name);
+      if (!name) {
+        errors.push("directory entry: agent name is required");
+        continue;
+      }
       const cardUrl = buildAgentUrl(base, name, AGENT_CARD_PATH);
+      validDirectory.push({ entry, name, cardUrl });
+    } catch (err) {
+      errors.push(`${entry.name}: ${/** @type {Error} */ (err).message}`);
+    }
+  }
+
+  const cardResults = await Promise.allSettled(
+    validDirectory.map(async ({ name, cardUrl }) => {
       const card = await fetchAgentCard(cardUrl, common);
       return summarizeCard(card, name, cardUrl);
     }),
@@ -794,17 +808,17 @@ export async function discoverAgents(options) {
     if (result.status === "fulfilled") {
       agents.push(result.value);
     } else {
-      const entry = directory[index];
-      errors.push(`${entry.name}: ${result.reason?.message ?? String(result.reason)}`);
+      const { entry, name, cardUrl } = validDirectory[index];
+      errors.push(`${name}: ${result.reason?.message ?? String(result.reason)}`);
       agents.push({
-        agent: entry.name,
+        agent: name,
         name: entry.name,
         description: entry.description,
         url: entry.url,
         version: undefined,
         streaming: false,
         skills: [],
-        cardUrl: buildAgentUrl(base, entry.name, AGENT_CARD_PATH),
+        cardUrl,
         card: {},
       });
     }

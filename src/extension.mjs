@@ -327,7 +327,20 @@ export default function registerPiA2aExtension(pi, options = {}) {
         if (params.encoding !== undefined && params.encoding !== "utf8" && params.encoding !== "base64") {
           throw new A2AError("encoding must be utf8 or base64");
         }
-        const content = params.encoding === "base64" ? Buffer.from(String(params.content), "base64") : String(params.content);
+        let content;
+        if (params.encoding === "base64") {
+          const stripped = String(params.content).replace(/[\r\n\t ]+/g, "");
+          if (stripped.length % 4 !== 0) {
+            throw new A2AError("invalid base64 content");
+          }
+          const decoded = Buffer.from(stripped, "base64");
+          if (decoded.toString("base64") !== stripped) {
+            throw new A2AError("invalid base64 content");
+          }
+          content = decoded;
+        } else {
+          content = String(params.content);
+        }
         const result = await sendFile(conn.baseUrl, {
           ...conn,
           taskId: params.task_id,
@@ -362,7 +375,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
         let body = "";
         if (!file.content.includes(0)) {
           try {
-            body = new TextDecoder("utf-8", { fatal: true }).decode(file.content);
+            body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(file.content);
             isText = true;
           } catch {
             isText = false;
