@@ -19,6 +19,8 @@ export const AGENT_DIRECTORY_PATH = "/a2a";
 export const MAX_AGENT_CARD_BYTES = 64 * 1024;
 export const MAX_RPC_BODY_BYTES = 4 * 1024 * 1024;
 export const MAX_SSE_BYTES = 4 * 1024 * 1024;
+export const MAX_FILE_BYTES = 8 * 1024 * 1024;
+export const FILES_PATH = "/files";
 export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export const REPLY_WITHHELD = "reply_withheld";
@@ -89,12 +91,59 @@ function normalizeAgent(agent) {
     return undefined;
   }
   const value = String(agent).trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+  if (!AGENT_NAME_PATTERN.test(value)) {
     throw new A2AError(
-      "Agent name must be 1-128 characters of letters, digits, '.', '_', or '-' and must not start with a punctuation character",
+      "Agent name must be 1-63 characters of lowercase letters, digits, or '-' and must start with a letter or digit (e.g. planner, researcher, reviewer)",
     );
   }
   return value;
+}
+
+/** Valid agent names, e.g. `planner`, `researcher`, `reviewer`. */
+export const AGENT_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
+
+/**
+ * Validates a single URL path segment (task id or file name) so it cannot traverse
+ * directories or smuggle extra segments, encoded separators, or query strings.
+ *
+ * @param {unknown} value
+ * @param {RegExp} pattern
+ * @param {string} label
+ * @returns {string}
+ */
+function assertSegment(value, pattern, label) {
+  if (typeof value !== "string" || value === "") {
+    throw new A2AError(`${label} is required`);
+  }
+  if (!pattern.test(value) || value.includes("..")) {
+    throw new A2AError(
+      `Invalid ${label}: must be a single path segment of letters, digits, '.', '_', '-' (no slashes, '..', or encoded characters)`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Throws unless `baseUrl` has the same origin as `pinnedOrigin` (when given). Used so
+ * credentials resolved for one gateway are never sent to another.
+ *
+ * @param {string | URL} baseUrl
+ * @param {string | URL | undefined} pinnedOrigin
+ */
+function assertPinnedOrigin(baseUrl, pinnedOrigin) {
+  if (pinnedOrigin === undefined || pinnedOrigin === null || pinnedOrigin === "") return;
+  const requested = assertAllowedBaseUrl(baseUrl).origin;
+  let pinned;
+  try {
+    pinned = new URL(String(pinnedOrigin)).origin;
+  } catch {
+    throw new A2AError("Invalid pinned origin");
+  }
+  if (requested !== pinned) {
+    throw new A2AError(`Refusing to send credentials to cross-origin URL ${requested} (pinned origin: ${pinned}).`);
+  }
 }
 
 /**
@@ -186,6 +235,17 @@ function withTimeout(signal, timeoutMs) {
  * @returns {Promise<string>}
  */
 export async function readBodyCapped(response, maxBytes) {
+  return (await readBytesCapped(response, maxBytes)).toString("utf8");
+}
+
+/**
+ * Reads a response body as bytes, aborting once `maxBytes` is exceeded.
+ *
+ * @param {Response} response
+ * @param {number} maxBytes
+ * @returns {Promise<Buffer>}
+ */
+export async function readBytesCapped(response, maxBytes) {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > maxBytes) {
     throw new A2AError(`Response body of ${declared} bytes exceeds limit of ${maxBytes} bytes`, {
@@ -193,7 +253,7 @@ export async function readBodyCapped(response, maxBytes) {
     });
   }
   if (!response.body) {
-    return "";
+    return Buffer.alloc(0);
   }
   const reader = response.body.getReader();
   const chunks = [];
@@ -214,9 +274,7 @@ export async function readBodyCapped(response, maxBytes) {
       await response.body.cancel().catch(() => {});
     }
   }
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))).toString(
-    "utf8",
-  );
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)));
 }
 
 /**
@@ -226,13 +284,13 @@ export async function readBodyCapped(response, maxBytes) {
  * @param {{
  *   method?: string;
  *   headers?: Record<string, string>;
- *   body?: string;
+ *   body?: string | Uint8Array;
  *   signal?: AbortSignal;
  *   maxBytes: number;
  *   timeoutMs?: number;
  *   fetchImpl?: typeof fetch;
  * }} options
- * @returns {Promise<{ status: number; headers: Headers; text: string }>}
+ * @returns {Promise<{ status: number; headers: Headers; text: string; bytes: Buffer }>}
  */
 async function fetchCapped(url, options) {
   const { signal, cleanup } = withTimeout(options.signal, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
@@ -251,8 +309,8 @@ async function fetchCapped(url, options) {
       if (signal.aborted && signal.reason instanceof A2AError) throw signal.reason;
       throw new A2AError(`A2A request to ${redactUrl(url)} failed: ${describeCause(cause)}`, { cause });
     }
-    const text = await readBodyCapped(response, options.maxBytes);
-    return { status: response.status, headers: response.headers, text };
+    const bytes = await readBytesCapped(response, options.maxBytes);
+    return { status: response.status, headers: response.headers, text: bytes.toString("utf8"), bytes };
   } finally {
     cleanup();
   }
@@ -364,6 +422,7 @@ function rpcError(error, status) {
  * @returns {Promise<unknown>}
  */
 export async function rpcCall(options) {
+  assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
   const url = buildRpcUrl(options.baseUrl, options.agent);
   const id = newId();
   const body = JSON.stringify({ jsonrpc: "2.0", id, method: options.method, params: options.params });
@@ -666,6 +725,7 @@ function summarizeCard(card, agent, cardUrl) {
  * @returns {Promise<{ baseUrl: string; agents: Array<ReturnType<typeof summarizeCard>>; directory: Array<{ name: string }>; errors: string[] }>}
  */
 export async function discoverAgents(options) {
+  assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
   const base = assertAllowedBaseUrl(options.baseUrl);
   const agent = normalizeAgent(options.agent);
   const common = {
@@ -722,10 +782,24 @@ export async function discoverAgents(options) {
     errors.push(`directory: ${directoryResult.reason?.message ?? String(directoryResult.reason)}`);
   }
 
-  const cardResults = await Promise.allSettled(
-    directory.map(async (entry) => {
+  /** @type {Array<{ entry: { name: string; description?: string; url?: string }; name: string; cardUrl: URL }>} */
+  const validDirectory = [];
+  for (const entry of directory) {
+    try {
       const name = normalizeAgent(entry.name);
+      if (!name) {
+        errors.push("directory entry: agent name is required");
+        continue;
+      }
       const cardUrl = buildAgentUrl(base, name, AGENT_CARD_PATH);
+      validDirectory.push({ entry, name, cardUrl });
+    } catch (err) {
+      errors.push(`${entry.name}: ${/** @type {Error} */ (err).message}`);
+    }
+  }
+
+  const cardResults = await Promise.allSettled(
+    validDirectory.map(async ({ name, cardUrl }) => {
       const card = await fetchAgentCard(cardUrl, common);
       return summarizeCard(card, name, cardUrl);
     }),
@@ -734,17 +808,17 @@ export async function discoverAgents(options) {
     if (result.status === "fulfilled") {
       agents.push(result.value);
     } else {
-      const entry = directory[index];
-      errors.push(`${entry.name}: ${result.reason?.message ?? String(result.reason)}`);
+      const { entry, name, cardUrl } = validDirectory[index];
+      errors.push(`${name}: ${result.reason?.message ?? String(result.reason)}`);
       agents.push({
-        agent: entry.name,
+        agent: name,
         name: entry.name,
         description: entry.description,
         url: entry.url,
         version: undefined,
         streaming: false,
         skills: [],
-        cardUrl: buildAgentUrl(base, entry.name, AGENT_CARD_PATH),
+        cardUrl,
         card: {},
       });
     }
@@ -754,6 +828,28 @@ export async function discoverAgents(options) {
     throw new A2AError(`No A2A agents discovered at ${redactUrl(base.toString())}: ${errors.join("; ")}`);
   }
   return { baseUrl: base.toString(), agents, directory, errors };
+}
+
+/**
+ * Fetches a single Agent Card: `/a2a/{agent}/.well-known/agent.json`, or the root card
+ * `/.well-known/agent.json` when `agent` is omitted.
+ *
+ * @param {{
+ *   baseUrl: string | URL;
+ *   agent?: string;
+ *   pinnedOrigin?: string | URL;
+ *   headers?: Record<string, string>;
+ *   signal?: AbortSignal;
+ *   timeoutMs?: number;
+ *   fetchImpl?: typeof fetch;
+ * }} options
+ */
+export async function getAgentCard(options) {
+  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
+  const agent = normalizeAgent(options.agent);
+  const cardUrl = buildAgentUrl(options.baseUrl, agent, AGENT_CARD_PATH);
+  const card = await fetchAgentCard(cardUrl, options);
+  return summarizeCard(card, agent, cardUrl);
 }
 
 /**
@@ -802,6 +898,7 @@ export function buildMessageParams(input) {
  * @returns {Promise<{ taskId: string | undefined; contextId: string | undefined; state: string; text: string; raw: unknown; error?: string; events?: unknown[] }>}
  */
 export async function sendMessage(options) {
+  assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
   const params = buildMessageParams(options);
   if (options.stream) {
     return streamMessage(options, params);
@@ -975,9 +1072,23 @@ async function streamMessage(options, params) {
 }
 
 /**
- * Fetches a task with `tasks/get`.
+ * Accepts either `fn(options)` (with `options.baseUrl`) or `fn(baseUrl, options)`.
  *
- * @param {{
+ * @param {any} baseUrlOrOptions
+ * @param {any} [maybeOptions]
+ * @returns {any}
+ */
+function withBaseUrl(baseUrlOrOptions, maybeOptions) {
+  if (typeof baseUrlOrOptions === "string" || baseUrlOrOptions instanceof URL) {
+    return { ...(maybeOptions ?? {}), baseUrl: baseUrlOrOptions };
+  }
+  return baseUrlOrOptions ?? {};
+}
+
+/**
+ * Fetches a task with `tasks/get`. Callable as `getTask(options)` or `getTask(baseUrl, options)`.
+ *
+ * @param {string | URL | {
  *   baseUrl: string | URL;
  *   agent?: string;
  *   taskId: string;
@@ -988,7 +1099,9 @@ async function streamMessage(options, params) {
  *   fetchImpl?: typeof fetch;
  * }} options
  */
-export async function getTask(options) {
+export async function getTask(baseUrlOrOptions, maybeOptions) {
+  const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
+  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
   if (!options.taskId) throw new A2AError("taskId is required");
   /** @type {Record<string, unknown>} */
   const params = { id: String(options.taskId) };
@@ -1019,7 +1132,9 @@ export async function getTask(options) {
  *   fetchImpl?: typeof fetch;
  * }} options
  */
-export async function cancelTask(options) {
+export async function cancelTask(baseUrlOrOptions, maybeOptions) {
+  const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
+  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
   if (!options.taskId) throw new A2AError("taskId is required");
   const result = await rpcCall({
     baseUrl: options.baseUrl,
@@ -1032,4 +1147,125 @@ export async function cancelTask(options) {
     fetchImpl: options.fetchImpl,
   });
   return normalizeResult(result);
+}
+
+/**
+ * Builds `<base>/files/{taskId}/{name}` after validating both segments.
+ *
+ * @param {string | URL} baseUrl
+ * @param {string} taskId
+ * @param {string} name
+ */
+export function buildFileUrl(baseUrl, taskId, name) {
+  const id = assertSegment(taskId, TASK_ID_PATTERN, "taskId");
+  const file = assertSegment(name, FILE_NAME_PATTERN, "file name");
+  return buildAgentUrl(baseUrl, undefined, `${FILES_PATH}/${encodeURIComponent(id)}/${encodeURIComponent(file)}`);
+}
+
+/**
+ * Uploads a file into a task's staging area: `POST /files/{taskId}/{name}`.
+ *
+ * Callable as `sendFile(baseUrl, options)` or `sendFile({ baseUrl, ...options })`.
+ * `content` may be a string (UTF-8), `Buffer`, or `Uint8Array` (max 8 MiB).
+ * When `pinnedOrigin` is given, the call is refused unless `baseUrl` has the same origin,
+ * so credentials from `headers` cannot leak to another host.
+ *
+ * @param {string | URL | Record<string, any>} baseUrlOrOptions
+ * @param {{
+ *   taskId: string;
+ *   name: string;
+ *   content: string | Uint8Array;
+ *   contentType?: string;
+ *   pinnedOrigin?: string | URL;
+ *   headers?: Record<string, string>;
+ *   signal?: AbortSignal;
+ *   timeoutMs?: number;
+ *   fetchImpl?: typeof fetch;
+ * }} [maybeOptions]
+ * @returns {Promise<{ taskId: string; name: string; size: number; status: number; response: unknown; url: string }>}
+ */
+export async function sendFile(baseUrlOrOptions, maybeOptions) {
+  const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
+  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
+  const url = buildFileUrl(options.baseUrl, options.taskId, options.name);
+  const content = options.content;
+  if (typeof content !== "string" && !(content instanceof Uint8Array)) {
+    throw new A2AError("content must be a string or Uint8Array");
+  }
+  const body = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+  if (body.byteLength > MAX_FILE_BYTES) {
+    throw new A2AError(`File of ${body.byteLength} bytes exceeds limit of ${MAX_FILE_BYTES} bytes`);
+  }
+  const contentType = options.contentType ?? "application/octet-stream";
+  const { status, text } = await fetchCapped(url, {
+    method: "POST",
+    headers: mergeHeaders(options.headers, { "content-type": contentType, accept: "application/json" }),
+    body,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    maxBytes: MAX_RPC_BODY_BYTES,
+    fetchImpl: options.fetchImpl,
+  });
+  if (status < 200 || status >= 300) {
+    throw new A2AError(`File upload to ${redactUrl(url)} failed with HTTP ${status}: ${snippet(text) || "(no body)"}`, {
+      status,
+    });
+  }
+  let response = null;
+  if (text.trim()) {
+    try {
+      response = JSON.parse(text);
+    } catch {
+      response = text;
+    }
+  }
+  return { taskId: options.taskId, name: options.name, size: body.byteLength, status, response, url: redactUrl(url) };
+}
+
+/**
+ * Downloads a staged task file: `GET /files/{taskId}/{name}` (max 8 MiB).
+ *
+ * Callable as `getFile(baseUrl, options)` or `getFile({ baseUrl, ...options })`.
+ *
+ * @param {string | URL | Record<string, any>} baseUrlOrOptions
+ * @param {{
+ *   taskId: string;
+ *   name: string;
+ *   pinnedOrigin?: string | URL;
+ *   headers?: Record<string, string>;
+ *   signal?: AbortSignal;
+ *   timeoutMs?: number;
+ *   fetchImpl?: typeof fetch;
+ * }} [maybeOptions]
+ * @returns {Promise<{ taskId: string; name: string; size: number; contentType: string; content: Buffer; text: string; url: string }>}
+ */
+export async function getFile(baseUrlOrOptions, maybeOptions) {
+  const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
+  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
+  const url = buildFileUrl(options.baseUrl, options.taskId, options.name);
+  const { status, headers, text, bytes } = await fetchCapped(url, {
+    method: "GET",
+    headers: mergeHeaders(options.headers, { accept: "*/*" }),
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    maxBytes: MAX_FILE_BYTES,
+    fetchImpl: options.fetchImpl,
+  });
+  if (status === 404) {
+    throw new A2AError(`File not found at ${redactUrl(url)} (HTTP 404)`, { status });
+  }
+  if (status < 200 || status >= 300) {
+    throw new A2AError(`File download from ${redactUrl(url)} failed with HTTP ${status}: ${snippet(text) || "(no body)"}`, {
+      status,
+    });
+  }
+  return {
+    taskId: options.taskId,
+    name: options.name,
+    size: bytes.byteLength,
+    contentType: headers.get("content-type") ?? "application/octet-stream",
+    content: bytes,
+    text,
+    url: redactUrl(url),
+  };
 }

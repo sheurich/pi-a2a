@@ -1,9 +1,10 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   A2AError,
@@ -13,6 +14,10 @@ import {
   cancelTask,
   discoverAgents,
   getTask,
+  getAgentCard,
+  getFile,
+  sendFile,
+  buildFileUrl,
   isReplyWithheld,
   normalizeResult,
   parseSseStream,
@@ -54,6 +59,10 @@ const cards = {
 const tasks = new Map();
 /** @type {Array<{ path: string; headers: http.IncomingHttpHeaders; body: any }>} */
 const requests = [];
+/** @type {Map<string, { body: Buffer; type: string }>} */
+const files = new Map();
+/** @type {Array<{ method: string; path: string; headers: http.IncomingHttpHeaders; body?: Buffer }>} */
+const fileRequests = [];
 
 let counter = 0;
 const nextId = (prefix) => `${prefix}-${++counter}`;
@@ -98,11 +107,37 @@ async function handle(req, res) {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const path = url.pathname;
 
+  const fileMatch = /^\/files\/([^/]+)\/([^/]+)$/.exec(path);
+  if (fileMatch && (req.method === "POST" || req.method === "GET")) {
+    const key = `${fileMatch[1]}/${fileMatch[2]}`;
+    if (req.method === "POST") {
+      const buf = Buffer.concat(await new Promise((resolve, reject) => {
+        const chunks = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => resolve(chunks));
+        req.on("error", reject);
+      }));
+      fileRequests.push({ method: "POST", path, headers: req.headers, body: buf });
+      files.set(key, { body: buf, type: req.headers["content-type"] ?? "application/octet-stream" });
+      return json(res, 201, { ok: true, size: buf.length });
+    }
+    fileRequests.push({ method: "GET", path, headers: req.headers });
+    const file = files.get(key);
+    if (!file) {
+      res.writeHead(404);
+      return res.end("no such file");
+    }
+    res.writeHead(200, { "content-type": file.type, "content-length": file.body.length });
+    return res.end(file.body);
+  }
   if (req.method === "GET") {
     if (path === "/.well-known/agent.json") return json(res, 200, cards.root);
     if (path === "/a2a") return json(res, 200, { agents: ["echo", { name: "clerk", description: "dir entry" }] });
     if (path === "/a2a/echo/.well-known/agent.json") return json(res, 200, cards.echo);
     if (path === "/a2a/clerk/.well-known/agent.json") return json(res, 200, cards.clerk);
+    if (path === "/a2a/researcher/.well-known/agent.json") {
+      return json(res, 200, { name: "Researcher", description: "Research", version: "1.2.0", capabilities: { streaming: true }, skills: [{ id: "r", name: "Research" }] });
+    }
     if (path === "/a2a/big/.well-known/agent.json") {
       return json(res, 200, { name: "Big", padding: "x".repeat(MAX_AGENT_CARD_BYTES + 1024) });
     }
@@ -137,7 +172,7 @@ async function handle(req, res) {
   if (method === "message/send") {
     const incoming = params.message;
     const userText = incoming.parts.map((p) => p.text ?? "").join("");
-    if (agent === "echo") {
+    if (agent === "echo" || agent === "planner" || agent === "researcher" || agent === "reviewer") {
       const taskId = incoming.taskId ?? nextId("task");
       const task = {
         kind: "task",
@@ -297,7 +332,7 @@ describe("Agent Card discovery", () => {
     assert.doesNotThrow(() => assertAllowedBaseUrl("http://localhost:8080/base"));
     assert.throws(() => assertAllowedBaseUrl("http://agents.example.com"), A2AError);
     assert.throws(() => assertAllowedBaseUrl("ftp://agents.example.com"), A2AError);
-    assert.throws(() => assertAllowedBaseUrl("https://user:pw@agents.example.com"), /credentials/);
+    assert.throws(() => assertAllowedBaseUrl("https://user:agent-test@example.invalid"), /credentials/);
     assert.throws(() => assertAllowedBaseUrl(""), /required/);
   });
 
@@ -431,14 +466,29 @@ describe("message/stream SSE", () => {
 // ---------------------------------------------------------------------------
 
 describe("input-required + a2a_reply continuation", () => {
-  it("registers exactly five tools reading defaults from process.env", () => {
+  it("registers all ten tools, reading defaults from process.env", () => {
     const saved = { url: process.env.PI_A2A_URL, helper: process.env.PI_A2A_HEADERS_HELPER };
     process.env.PI_A2A_URL = baseUrl;
     delete process.env.PI_A2A_HEADERS_HELPER;
     try {
       const pi = fakePi();
       registerPiA2aExtension(pi);
-      assert.deepEqual([...pi.tools.keys()].sort(), ["a2a_agents", "a2a_cancel", "a2a_reply", "a2a_send", "a2a_status"]);
+      const names = [...pi.tools.keys()].sort();
+      for (const original of ["a2a_agents", "a2a_cancel", "a2a_reply", "a2a_send", "a2a_status"]) {
+        assert.ok(names.includes(original), `missing original tool ${original}`);
+      }
+      assert.deepEqual(names, [
+        "a2a_agents",
+        "a2a_cancel",
+        "a2a_cancel_task",
+        "a2a_card",
+        "a2a_get_file",
+        "a2a_get_task",
+        "a2a_reply",
+        "a2a_send",
+        "a2a_send_file",
+        "a2a_status",
+      ]);
       for (const tool of pi.tools.values()) {
         assert.equal(typeof tool.execute, "function");
         assert.equal(tool.parameters.type, "object");
@@ -714,4 +764,294 @@ describe("headersHelper allowlist and redaction", () => {
     assert.equal(res2.isError, true);
     assert.match(res2.content[0].text, /PI_A2A_URL is not configured/);
   });
+});
+
+describe("multi-agent routing (agent option)", () => {
+  it("routes to /a2a/<agent> for named agents", async () => {
+    for (const agent of ["planner", "researcher", "reviewer"]) {
+      requests.length = 0;
+      const result = await sendMessage({ baseUrl, agent, message: "hi" });
+      assert.equal(result.state, "completed");
+      assert.equal(requests.at(-1).path, `/a2a/${agent}`);
+    }
+  });
+
+  it("rejects agent names outside [a-z0-9][a-z0-9-]{0,62}", async () => {
+    for (const bad of ["../x", "a/b", "Upper", "-lead", "a".repeat(64), "a b", "a%2fb", "a.b"]) {
+      assert.throws(() => buildAgentUrl(baseUrl, bad, "/x"), A2AError, bad);
+    }
+    assert.doesNotThrow(() => buildAgentUrl(baseUrl, "code-reviewer", "/x"));
+    assert.doesNotThrow(() => buildAgentUrl(baseUrl, "a".repeat(63), "/x"));
+  });
+
+  it("a2a_card fetches /a2a/<agent>/.well-known/agent.json", async () => {
+    const pi = fakePi();
+    registerPiA2aExtension(pi, { env: { PI_A2A_URL: baseUrl } });
+    const res = await pi.tools.get("a2a_card").execute("c", { agent: "researcher" }, undefined, undefined, {});
+    assert.notEqual(res.isError, true);
+    assert.match(res.content[0].text, /Researcher/);
+    const card = await getAgentCard({ baseUrl, agent: "echo" });
+    assert.equal(card.cardUrl, `${baseUrl}/a2a/echo/.well-known/agent.json`);
+  });
+
+  it("/a2a command routes @agent messages and cards", async () => {
+    const commands = new Map();
+    const pi = { registerTool() {}, registerCommand: (n, c) => commands.set(n, c) };
+    registerPiA2aExtension(pi, { env: { PI_A2A_URL: baseUrl } });
+    const notes = [];
+    const ctx = { ui: { notify: (m, l) => notes.push([m, l]) } };
+    requests.length = 0;
+    await commands.get("a2a").handler("@echo ping", ctx);
+    assert.equal(requests.at(-1).path, "/a2a/echo");
+    assert.match(notes.at(-1)[0], /echo: ping/);
+    await commands.get("a2a").handler("card @researcher", ctx);
+    assert.match(notes.at(-1)[0], /Researcher/);
+    await commands.get("a2a").handler("@../evil hi", ctx);
+    assert.equal(notes.at(-1)[1], "error");
+  });
+});
+
+describe("tasks tools and file staging", () => {
+  it("getTask/cancelTask accept (baseUrl, options) and route by agent", async () => {
+    const started = await sendMessage({ baseUrl, agent: "slow", message: "job" });
+    requests.length = 0;
+    const got = await getTask(baseUrl, { taskId: started.taskId, agent: "slow" });
+    assert.equal(got.state, "working");
+    assert.equal(requests.at(-1).path, "/a2a/slow");
+    assert.equal(requests.at(-1).body.method, "tasks/get");
+    const canceled = await cancelTask(baseUrl, { taskId: started.taskId, agent: "slow" });
+    assert.equal(canceled.state, "canceled");
+    assert.equal(requests.at(-1).body.method, "tasks/cancel");
+  });
+
+  it("a2a_get_task and a2a_cancel_task tools work", async () => {
+    const pi = fakePi();
+    registerPiA2aExtension(pi, { env: { PI_A2A_URL: baseUrl } });
+    const started = await sendMessage({ baseUrl, agent: "slow", message: "job" });
+    const got = await pi.tools.get("a2a_get_task").execute("g", { task_id: started.taskId, agent: "slow" }, undefined, undefined, {});
+    assert.equal(got.details.state, "working");
+    const c = await pi.tools.get("a2a_cancel_task").execute("c", { task_id: started.taskId, agent: "slow" }, undefined, undefined, {});
+    assert.equal(c.details.state, "canceled");
+  });
+
+  it("sendFile then getFile round-trips bytes via /files/{task}/{name}", async () => {
+    fileRequests.length = 0;
+    const bytes = Buffer.from([0, 1, 2, 255, 254]);
+    const up = await sendFile(baseUrl, { taskId: "task-9", name: "data.bin", content: bytes, headers: { authorization: "Bearer t" } });
+    assert.equal(up.size, 5);
+    assert.equal(fileRequests[0].method, "POST");
+    assert.equal(fileRequests[0].path, "/files/task-9/data.bin");
+    assert.equal(fileRequests[0].headers.authorization, "Bearer t");
+    const down = await getFile(baseUrl, { taskId: "task-9", name: "data.bin" });
+    assert.deepEqual([...down.content], [...bytes]);
+    assert.equal(fileRequests[1].method, "GET");
+    await assert.rejects(getFile(baseUrl, { taskId: "task-9", name: "missing.txt" }), /HTTP 404/);
+  });
+
+  it("a2a_send_file / a2a_get_file tools round-trip text", async () => {
+    const pi = fakePi();
+    registerPiA2aExtension(pi, { env: { PI_A2A_URL: baseUrl } });
+    const up = await pi.tools.get("a2a_send_file").execute("u", { task_id: "task-10", name: "note.txt", content: "héllo" }, undefined, undefined, {});
+    assert.notEqual(up.isError, true);
+    const down = await pi.tools.get("a2a_get_file").execute("d", { task_id: "task-10", name: "note.txt" }, undefined, undefined, {});
+    assert.notEqual(down.isError, true);
+    assert.match(down.content[0].text, /héllo/);
+  });
+
+  it("rejects path traversal in task ids and file names before any request", async () => {
+    fileRequests.length = 0;
+    const bad = ["../x", "a/b", "..", ".", "%2e%2e", "a%2fb", "a\\b", "x?y=1", "x#f", "a..b", "", ".hidden", "a\0b"];
+    for (const name of bad) {
+      await assert.rejects(sendFile(baseUrl, { taskId: "task-1", name, content: "x" }), A2AError, `name ${JSON.stringify(name)}`);
+      await assert.rejects(getFile(baseUrl, { taskId: "task-1", name }), A2AError, `name ${JSON.stringify(name)}`);
+      await assert.rejects(getFile(baseUrl, { taskId: name, name: "ok.txt" }), A2AError, `taskId ${JSON.stringify(name)}`);
+    }
+    assert.throws(() => buildFileUrl(baseUrl, "t1", "../../etc/passwd"), A2AError);
+    assert.equal(fileRequests.length, 0);
+  });
+
+  it("enforces a file size cap on upload", async () => {
+    await assert.rejects(
+      sendFile(baseUrl, { taskId: "t1", name: "big.bin", content: new Uint8Array(8 * 1024 * 1024 + 1) }),
+      /exceeds limit/,
+    );
+  });
+
+  it("file tools refuse cross-origin urls when a headersHelper is configured", async () => {
+    fileRequests.length = 0;
+    const pi = fakePi();
+    registerPiA2aExtension(pi, {
+      env: { PI_A2A_URL: baseUrl, PI_A2A_HEADERS_HELPER: `"${process.execPath}" "${goodHelper}"` },
+    });
+    for (const [tool, params] of [
+      ["a2a_send_file", { task_id: "t1", name: "a.txt", content: "x" }],
+      ["a2a_get_file", { task_id: "t1", name: "a.txt" }],
+      ["a2a_get_task", { task_id: "t1" }],
+      ["a2a_cancel_task", { task_id: "t1" }],
+      ["a2a_card", {}],
+    ]) {
+      const res = await pi.tools.get(tool).execute("x", { ...params, url: "https://attacker.example" }, undefined, undefined, {});
+      assert.equal(res.isError, true, tool);
+      assert.match(res.content[0].text, /cross-origin URL/, tool);
+      assert.doesNotMatch(res.content[0].text, /test-token-abc/);
+    }
+    assert.equal(fileRequests.length, 0);
+  });
+
+  it("client-level pinnedOrigin blocks credentials to a different origin", async () => {
+    await assert.rejects(
+      sendFile("https://attacker.example", { taskId: "t1", name: "a.txt", content: "x", headers: { authorization: "Bearer s" }, pinnedOrigin: baseUrl }),
+      /cross-origin/,
+    );
+    await assert.rejects(
+      getFile({ baseUrl: "https://attacker.example", taskId: "t1", name: "a.txt", pinnedOrigin: baseUrl }),
+      /cross-origin/,
+    );
+    await assert.rejects(getTask("https://attacker.example", { taskId: "t1", pinnedOrigin: baseUrl }), /cross-origin/);
+    await assert.rejects(cancelTask("https://attacker.example", { taskId: "t1", pinnedOrigin: baseUrl }), /cross-origin/);
+  });
+
+  it("file helper sends credentials to the pinned origin only", async () => {
+    fileRequests.length = 0;
+    const pi = fakePi();
+    registerPiA2aExtension(pi, {
+      env: { PI_A2A_URL: baseUrl, PI_A2A_HEADERS_HELPER: `"${process.execPath}" "${goodHelper}"` },
+    });
+    const res = await pi.tools.get("a2a_send_file").execute("x", { task_id: "t2", name: "a.txt", content: "x" }, undefined, undefined, {});
+    assert.notEqual(res.isError, true);
+    assert.equal(fileRequests[0].headers.authorization, "Bearer test-token-abc");
+  });
+});
+
+it("sendMessage and discoverAgents enforce pinnedOrigin and a2a_get_file encodes non-UTF8 bytes as base64", async () => {
+  await assert.rejects(
+    () =>
+      sendMessage({
+        baseUrl: "https://attacker.example",
+        pinnedOrigin: "https://agents.example.com",
+        headers: { authorization: "Bearer TEST" },
+        message: "hi",
+        fetchImpl: async () => {
+          throw new Error("fetch must not be called");
+        },
+      }),
+    /Refusing to send credentials to cross-origin URL/,
+  );
+
+  await assert.rejects(
+    () =>
+      discoverAgents({
+        baseUrl: "https://attacker.example",
+        pinnedOrigin: "https://agents.example.com",
+        fetchImpl: async () => {
+          throw new Error("fetch must not be called");
+        },
+      }),
+    /Refusing to send credentials to cross-origin URL/,
+  );
+
+  const tools = new Map();
+  registerPiA2aExtension(
+    {
+      registerTool(def) {
+        tools.set(def.name, def);
+      },
+    },
+    {
+      env: { PI_A2A_URL: "https://agents.example.com" },
+      fetchImpl: async () =>
+        new Response(Uint8Array.from([0xff]), {
+          status: 200,
+          headers: { "content-type": "application/octet-stream" },
+        }),
+    },
+  );
+  const res = await tools.get("a2a_get_file").execute("c1", { task_id: "t1", name: "raw.bin" });
+  assert.equal(res.details.encoding, "base64");
+  assert.match(res.content[0].text, /\/w==/);
+});
+
+
+it("discoverAgents isolates invalid directory entries without failing valid agents", async () => {
+  const res = await discoverAgents({
+    baseUrl: "https://agents.example.com",
+    fetchImpl: async (input) => {
+      const u = String(input);
+      if (u.endsWith("/.well-known/agent.json") && !u.includes("/a2a/")) {
+        return new Response(JSON.stringify({ name: "Root", url: "/a2a" }), { status: 200 });
+      }
+      if (u.endsWith("/a2a")) {
+        return new Response(JSON.stringify({ agents: [{ name: "Legacy_Agent" }, { name: "planner" }] }), { status: 200 });
+      }
+      if (u.endsWith("/a2a/planner/.well-known/agent.json")) {
+        return new Response(JSON.stringify({ name: "Planner", url: "/a2a/planner" }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+  assert.equal(res.agents.length, 2);
+  assert.ok(res.errors.some((e) => e.includes("Legacy_Agent")));
+});
+
+it("a2a_send_file rejects malformed base64 and a2a_get_file preserves UTF-8 BOM", async () => {
+  const bomBytes = Uint8Array.from([0xef, 0xbb, 0xbf, 0x68, 0x69]);
+  const tools = new Map();
+  registerPiA2aExtension(
+    {
+      registerTool(def) {
+        tools.set(def.name, def);
+      },
+    },
+    {
+      env: { PI_A2A_URL: "https://agents.example.com" },
+      fetchImpl: async () =>
+        new Response(bomBytes, {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        }),
+    },
+  );
+  const badUpload = await tools.get("a2a_send_file").execute("c1", {
+    task_id: "t1",
+    name: "bad.bin",
+    content: "aGVsbG8=THIS_IS_NOT_THE_END",
+    encoding: "base64",
+  });
+  assert.equal(badUpload.isError, true);
+
+  const bomRes = await tools.get("a2a_get_file").execute("c2", {
+    task_id: "t1",
+    name: "bom.txt",
+  });
+  assert.equal(bomRes.details.encoding, "utf8");
+  const bodyText = bomRes.content[0].text.split("\n\n")[1];
+  assert.deepEqual(Buffer.from(bodyText, "utf8"), Buffer.from(bomBytes));
+
+  const large8Mb = Buffer.alloc(8 * 1024 * 1024, 255).toString("base64");
+  const okLarge = await tools.get("a2a_send_file").execute("c3", {
+    task_id: "t1",
+    name: "large.bin",
+    content: large8Mb,
+    encoding: "base64",
+  });
+  assert.equal(okLarge.isError, undefined);
+});
+
+it("package.json pi.extensions manifest resolves to an extension factory function", async () => {
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+  assert.ok(pkg.pi && typeof pkg.pi === "object" && !Array.isArray(pkg.pi));
+  assert.equal(pkg.pi.extension, undefined);
+  assert.ok(Array.isArray(pkg.pi.extensions) && pkg.pi.extensions.length > 0);
+
+  for (const entry of pkg.pi.extensions) {
+    assert.equal(typeof entry, "string");
+    const resolvedPath = resolve(packageRoot, entry);
+    assert.equal(existsSync(resolvedPath), true, `missing pi.extensions entry: ${entry}`);
+    const mod = await import(pathToFileURL(resolvedPath).href);
+    assert.equal(typeof mod.default, "function");
+    const pi = fakePi();
+    mod.default(pi, { env: { PI_A2A_URL: baseUrl } });
+    assert.ok(pi.tools.size > 0);
+  }
 });

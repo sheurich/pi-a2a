@@ -25,6 +25,13 @@ export interface A2aRegisteredTool {
 /** Minimal structural view of Pi's ExtensionAPI used by this extension. */
 export interface PiLikeExtensionApi {
   registerTool(tool: A2aRegisteredTool): void;
+  registerCommand?(
+    name: string,
+    command: {
+      description?: string;
+      handler(args: string | undefined, ctx?: { ui?: { notify?(message: string, level?: string): void } }): Promise<void>;
+    },
+  ): void;
 }
 
 export interface PiA2aOptions {
@@ -63,7 +70,9 @@ export function readConfig(env?: NodeJS.ProcessEnv): {
 export function formatResult(result: NormalizedTaskResult, heading: string): string;
 
 /**
- * Registers a2a_agents, a2a_send, a2a_status, a2a_reply, and a2a_cancel.
+ * Registers a2a_agents, a2a_card, a2a_send, a2a_status, a2a_reply, a2a_cancel,
+ * a2a_get_task, a2a_cancel_task, a2a_send_file, and a2a_get_file, plus the `/a2a` command
+ * when the host provides `registerCommand`.
  */
 export default function registerPiA2aExtension(pi: PiLikeExtensionApi, options?: PiA2aOptions): void;
 export { registerPiA2aExtension };

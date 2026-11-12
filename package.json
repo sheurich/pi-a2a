@@ -26,6 +26,8 @@
   },
   "license": "MIT",
   "pi": {
-    "extension": "./src/extension.mjs"
+    "extensions": [
+      "./src/extension.mjs"
+    ]
   }
 }

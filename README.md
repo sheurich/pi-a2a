@@ -4,7 +4,7 @@ Pi extension for discovering and talking to [A2A](https://a2a-protocol.org) agen
 
 ## Overview
 
-`pi-a2a` gives Pi five tools that let the model find remote agents behind an A2A gateway, send them work, stream their replies, answer their follow-up questions, and check or cancel tasks. It has zero runtime dependencies: everything is built on Node's `fetch`, `node:http`, and `node:child_process`.
+`pi-a2a` gives Pi ten tools that let the model find remote agents behind an A2A gateway, send them work, stream their replies, answer their follow-up questions, and check or cancel tasks. It has zero runtime dependencies: everything is built on Node's `fetch`, `node:http`, and `node:child_process`.
 
 Security defaults:
 
@@ -16,11 +16,11 @@ Security defaults:
 
 ## Configuration
 
-Install the package and point Pi at it, for example in `~/.pi/agent/settings.json`:
+Install the package with `pi install npm:@sheurich/pi-a2a` (or `pi install git:github.com/sheurich/pi-a2a`), or add it to `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "extensions": ["@sheurich/pi-a2a"]
+  "packages": ["npm:@sheurich/pi-a2a"]
 }
 ```
 
@@ -57,13 +57,35 @@ process.stdout.write(JSON.stringify({ authorization: `Bearer ${process.env.MY_TO
 | `a2a_status` | `task_id`, `agent?`, `url?` | Calls `tasks/get` and returns the current state, artifacts, and latest agent message. |
 | `a2a_reply` | `task_id`, `message`, `agent?`, `url?`, `context_id?`, `stream?` | Continues a task that is in `input-required` by sending another user message with the same `taskId`. |
 | `a2a_cancel` | `task_id`, `agent?`, `url?` | Calls `tasks/cancel`. |
+| `a2a_card` | `agent?`, `url?` | Fetches one agent's card from `/a2a/{agent}/.well-known/agent.json` (root card without `agent`). |
+| `a2a_get_task` | `task_id`, `agent?`, `url?` | Calls `tasks/get` on `/a2a/{agent}`. |
+| `a2a_cancel_task` | `task_id`, `agent?`, `url?` | Calls `tasks/cancel` on `/a2a/{agent}`. |
+| `a2a_send_file` | `task_id`, `name`, `content`, `encoding?`, `content_type?`, `url?` | Stages a file with `POST /files/{task_id}/{name}` (max 8 MiB). |
+| `a2a_get_file` | `task_id`, `name`, `url?` | Downloads a staged file with `GET /files/{task_id}/{name}` (text inline, binary as base64). |
+
+### Multi-agent routing
+
+`agent` is an optional name matching `[a-z0-9][a-z0-9-]{0,62}` (for example `research`, `code-review`, `incident-triage`, `main`). It resolves to `<base>/a2a/<agent>` for JSON-RPC and `<base>/a2a/<agent>/.well-known/agent.json` for the card. Anything else (uppercase, `/`, `..`, `.`, encoded separators) is rejected before any request is made. The default comes from `PI_A2A_AGENT`.
+
+The slash command `/a2a [@agent] <message>` sends a message, and `/a2a card [@agent]` shows a card, when the host supports `registerCommand`.
+
+### Task file staging
+
+`task_id` and `name` must each be a single path segment (letters, digits, `.`, `_`, `-`; no `/`, `\`, `..`, `%`, `?`, `#`), so they cannot traverse out of `/files/{task_id}/`. Files are posted as raw bytes, with `application/octet-stream` unless `content_type` is given.
+
+### Credential pinning
+
+When `PI_A2A_HEADERS_HELPER` is set, a tool-supplied `url` must have the same origin as `PI_A2A_URL`. This applies to every tool, including the file tools. The extension also passes `pinnedOrigin` to the client, which refuses any call whose base URL has a different origin. Redirects are never followed.
 
 Task states surfaced to the model: `submitted`, `working`, `input-required`, `completed`, `failed`, `canceled`, `rejected`, `auth-required`, and `reply_withheld`. When a result is `input-required`, the tool output tells the model to continue with `a2a_reply`.
 
 The underlying client is exported for direct use:
 
 ```js
-import { discoverAgents, sendMessage, getTask, cancelTask } from "@sheurich/pi-a2a/client";
+import { discoverAgents, sendMessage, getTask, cancelTask, sendFile, getFile } from "@sheurich/pi-a2a/client";
+// getTask(baseUrl, { taskId, agent }), cancelTask(baseUrl, { taskId, agent }),
+// sendFile(baseUrl, { taskId, name, content }), getFile(baseUrl, { taskId, name })
+// All accept `pinnedOrigin` to refuse calls to any other origin.
 
 const { agents } = await discoverAgents({ baseUrl: "https://agents.example.com" });
 const reply = await sendMessage({
@@ -86,7 +108,7 @@ The test suite spins up a loopback mock gateway with `node:http` and covers Agen
 
 Layout:
 
-- `src/client.mjs` — A2A JSON-RPC/SSE client (`discoverAgents`, `sendMessage`, `getTask`, `cancelTask`, `parseSseStream`)
+- `src/client.mjs` — A2A JSON-RPC/SSE client (`discoverAgents`, `getAgentCard`, `sendMessage`, `getTask`, `cancelTask`, `sendFile`, `getFile`, `parseSseStream`)
 - `src/headers-helper.mjs` — helper command runner with strict header allowlist
 - `src/extension.mjs` — Pi tool registration (`registerPiA2aExtension`)
 - `src/extension.d.ts` — type declarations

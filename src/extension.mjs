@@ -1,12 +1,15 @@
 /**
  * Pi extension: tools for talking to A2A-compatible agents.
  *
- * Registers five tools:
+ * Registers these tools (plus a `/a2a [@agent] <message>` command when the host supports it):
  * - a2a_agents  — discover Agent Cards
+ * - a2a_card    — fetch one agent's card (`agent` routes to /a2a/<agent>)
  * - a2a_send    — start a conversation (message/send or message/stream)
  * - a2a_status  — tasks/get
  * - a2a_reply   — continue an `input-required` task (message/send with taskId)
  * - a2a_cancel  — tasks/cancel
+ * - a2a_get_task / a2a_cancel_task — tasks/get and tasks/cancel
+ * - a2a_send_file / a2a_get_file   — POST/GET /files/{task_id}/{name}
  *
  * Configuration comes from the environment:
  * - PI_A2A_URL             default HTTPS base URL of the A2A gateway
@@ -19,7 +22,7 @@
  * inject credentials or run arbitrary helper commands.
  */
 
-import { cancelTask, discoverAgents, getTask, sendMessage, A2AError } from "./client.mjs";
+import { cancelTask, discoverAgents, getAgentCard, getFile, getTask, sendFile, sendMessage, A2AError } from "./client.mjs";
 import { resolveHeaders } from "./headers-helper.mjs";
 
 export const ENV_URL = "PI_A2A_URL";
@@ -58,6 +61,10 @@ const agentProperty = {
   type: "string",
   description: `Agent name under /a2a/{agent}. Omit to use ${ENV_AGENT} or the root agent.`,
 };
+const fileNameProperty = {
+  type: "string",
+  description: "Single-segment file name (letters, digits, '.', '_', '-'); no slashes or '..'.",
+};
 const taskIdProperty = { type: "string", description: "Task id returned by a2a_send / a2a_reply." };
 const contextIdProperty = { type: "string", description: "Optional contextId to keep related tasks together." };
 const streamProperty = {
@@ -84,6 +91,21 @@ export function formatResult(result, heading) {
   }
   if (result.text) {
     lines.push("", result.text);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Formats a single Agent Card summary for the model.
+ *
+ * @param {{ agent?: string; name: string; description?: string; version?: string; streaming: boolean; cardUrl: string; skills: Array<{ id?: string; name?: string; description?: string }> }} summary
+ */
+export function formatCard(summary) {
+  const lines = [`A2A agent card: ${summary.agent ? `${summary.agent} — ` : ""}${summary.name}${summary.version ? ` v${summary.version}` : ""}`];
+  lines.push(`streaming: ${summary.streaming}`);
+  if (summary.description) lines.push(summary.description);
+  for (const skill of summary.skills.slice(0, 50)) {
+    lines.push(`• ${skill.name ?? skill.id}${skill.description ? `: ${skill.description}` : ""}`);
   }
   return lines.join("\n");
 }
@@ -172,8 +194,203 @@ export default function registerPiA2aExtension(pi, options = {}) {
     }
     const agent = params.agent?.trim() || options.agent || config.agent;
     const headers = headersHelper ? await resolveHeaders({ headersHelper, env }) : {};
-    return { baseUrl, agent, headers, fetchImpl: options.fetchImpl };
+    // Defense in depth: the client re-checks that the target origin equals the configured one
+    // whenever credentials are attached.
+    const pinnedOrigin = headersHelper && configuredUrl ? configuredUrl : undefined;
+    return { baseUrl, agent, headers, pinnedOrigin, fetchImpl: options.fetchImpl };
   }
+
+  /**
+   * Handles `/a2a [@agent] <message>` and `/a2a card [@agent]`.
+   *
+   * @param {string | undefined} args
+   * @param {{ ui?: { notify?: (message: string, level?: string) => void } }} [ctx]
+   */
+  async function runSlashCommand(args, ctx) {
+    const notify = (/** @type {string} */ message, level = "info") => ctx?.ui?.notify?.(message, level);
+    let rest = (args ?? "").trim();
+    let wantsCard = false;
+    if (/^card(\s|$)/.test(rest)) {
+      wantsCard = true;
+      rest = rest.slice(4).trim();
+    }
+    let agent;
+    const match = /^@(\S+)\s*/.exec(rest);
+    if (match) {
+      agent = match[1];
+      rest = rest.slice(match[0].length).trim();
+    }
+    if (!wantsCard && !rest) {
+      notify("Usage: /a2a [@agent] <message> | /a2a card [@agent]", "error");
+      return;
+    }
+    const result = await guard(async () => {
+      const conn = await connection({ agent });
+      if (wantsCard) {
+        const summary = await getAgentCard({ ...conn });
+        return { text: formatCard(summary), details: summary };
+      }
+      const sent = await sendMessage({ ...conn, message: rest });
+      return { text: formatResult(sent, "A2A message sent"), details: sent };
+    });
+    notify(result.content[0].text, result.isError ? "error" : "info");
+  }
+
+  if (typeof pi.registerCommand === "function") {
+    pi.registerCommand("a2a", {
+      description: "Send a message to an A2A agent: /a2a [@agent] <message>, or /a2a card [@agent]",
+      handler: runSlashCommand,
+    });
+  }
+
+  pi.registerTool({
+    name: "a2a_card",
+    label: "A2A Card",
+    description:
+      "Fetch one A2A agent's Agent Card (/a2a/{agent}/.well-known/agent.json, or the root card when no agent is given).",
+    parameters: {
+      type: "object",
+      properties: { agent: agentProperty, url: urlProperty },
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params, signal) {
+      return guard(async () => {
+        const conn = await connection(params ?? {});
+        const summary = await getAgentCard({ ...conn, signal });
+        const { card, ...details } = summary;
+        return { text: formatCard(summary), details };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_get_task",
+    label: "A2A Get Task",
+    description: "Get the current state, text, and artifacts of an A2A task (tasks/get).",
+    parameters: {
+      type: "object",
+      properties: { task_id: taskIdProperty, agent: agentProperty, url: urlProperty },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params, signal) {
+      return guard(async () => {
+        const conn = await connection(params);
+        const result = await getTask(conn.baseUrl, { ...conn, taskId: params.task_id, signal });
+        const { raw, ...details } = result;
+        return { text: formatResult(result, "A2A task"), details };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_cancel_task",
+    label: "A2A Cancel Task",
+    description: "Cancel a running A2A task (tasks/cancel).",
+    parameters: {
+      type: "object",
+      properties: { task_id: taskIdProperty, agent: agentProperty, url: urlProperty },
+      required: ["task_id"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params, signal) {
+      return guard(async () => {
+        const conn = await connection(params);
+        const result = await cancelTask(conn.baseUrl, { ...conn, taskId: params.task_id, signal });
+        const { raw, ...details } = result;
+        return { text: formatResult(result, "A2A task cancel requested"), details };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_send_file",
+    label: "A2A Send File",
+    description:
+      "Stage a file for an A2A task (POST /files/{task_id}/{name}). `name` must be a single file name without slashes. Content is UTF-8 text unless encoding is base64.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_id: taskIdProperty,
+        name: fileNameProperty,
+        content: { type: "string", description: "File content (UTF-8 text, or base64 when encoding=base64)." },
+        encoding: { type: "string", enum: ["utf8", "base64"], description: "Content encoding. Default utf8." },
+        content_type: { type: "string", description: "Optional MIME type. Default application/octet-stream." },
+        url: urlProperty,
+      },
+      required: ["task_id", "name", "content"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params, signal) {
+      return guard(async () => {
+        const conn = await connection(params);
+        if (params.encoding !== undefined && params.encoding !== "utf8" && params.encoding !== "base64") {
+          throw new A2AError("encoding must be utf8 or base64");
+        }
+        let content;
+        if (params.encoding === "base64") {
+          const stripped = String(params.content).replace(/[\r\n\t ]+/g, "");
+          if (stripped.length % 4 !== 0) {
+            throw new A2AError("invalid base64 content");
+          }
+          const decoded = Buffer.from(stripped, "base64");
+          if (decoded.toString("base64") !== stripped) {
+            throw new A2AError("invalid base64 content");
+          }
+          content = decoded;
+        } else {
+          content = String(params.content);
+        }
+        const result = await sendFile(conn.baseUrl, {
+          ...conn,
+          taskId: params.task_id,
+          name: params.name,
+          content,
+          contentType: params.content_type,
+          signal,
+        });
+        return {
+          text: `A2A file staged: ${result.name} (${result.size} bytes) for task ${result.taskId}`,
+          details: { taskId: result.taskId, name: result.name, size: result.size, status: result.status },
+        };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "a2a_get_file",
+    label: "A2A Get File",
+    description: "Download a staged task file (GET /files/{task_id}/{name}). Text is returned inline; binary files are returned as base64.",
+    parameters: {
+      type: "object",
+      properties: { task_id: taskIdProperty, name: fileNameProperty, url: urlProperty },
+      required: ["task_id", "name"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params, signal) {
+      return guard(async () => {
+        const conn = await connection(params);
+        const file = await getFile(conn.baseUrl, { ...conn, taskId: params.task_id, name: params.name, signal });
+        let isText = false;
+        let body = "";
+        if (!file.content.includes(0)) {
+          try {
+            body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(file.content);
+            isText = true;
+          } catch {
+            isText = false;
+          }
+        }
+        if (!isText) {
+          body = file.content.toString("base64");
+        }
+        return {
+          text: `A2A file ${file.name} (${file.size} bytes, ${file.contentType}, ${isText ? "utf8" : "base64"})\n\n${body}`,
+          details: { taskId: file.taskId, name: file.name, size: file.size, contentType: file.contentType, encoding: isText ? "utf8" : "base64" },
+        };
+      });
+    },
+  });
 
   pi.registerTool({
     name: "a2a_agents",
