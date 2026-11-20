@@ -1,39 +1,64 @@
 /**
  * Pi extension: tools for talking to A2A-compatible agents.
  *
- * Registers these tools (plus a `/a2a [@agent] <message>` command when the host supports it):
- * - a2a_agents  — discover Agent Cards
- * - a2a_card    — fetch one agent's card (`agent` routes to /a2a/<agent>)
- * - a2a_send    — start a conversation (message/send or message/stream)
- * - a2a_status  — tasks/get
- * - a2a_reply   — continue an `input-required` task (message/send with taskId)
- * - a2a_cancel  — tasks/cancel
+ * Registers eleven tools (plus a `/a2a` command when the host supports it):
+ * - a2a_gateways — list configured named A2A gateways (without exposing helper commands/secrets)
+ * - a2a_agents   — discover Agent Cards
+ * - a2a_card     — fetch one agent's card (`agent` routes to /a2a/<agent>)
+ * - a2a_send     — start a conversation (message/send or message/stream)
+ * - a2a_status   — tasks/get
+ * - a2a_reply    — continue an `input-required` task (message/send with taskId)
+ * - a2a_cancel   — tasks/cancel
  * - a2a_get_task / a2a_cancel_task — tasks/get and tasks/cancel
  * - a2a_send_file / a2a_get_file   — POST/GET /files/{task_id}/{name}
  *
- * Configuration comes from the environment:
- * - PI_A2A_URL             default HTTPS base URL of the A2A gateway
+ * Configuration comes from the environment and optional user-level config file:
+ * - PI_A2A_CONFIG          optional path to JSON gateway config (defaults to
+ *                          $PI_CODING_AGENT_DIR/a2a.json or $HOME/.pi/agent/a2a.json)
+ * - PI_A2A_GATEWAY         optional default named gateway from config
+ * - PI_A2A_URL             legacy default HTTPS base URL of a single A2A gateway
  * - PI_A2A_HEADERS_HELPER  optional command producing `authorization` /
  *                          `x-goog-iap-jwt-assertion` headers (JSON object or
  *                          `Header: value` lines on stdout)
- * - PI_A2A_AGENT           optional default agent name
+ * - PI_A2A_AGENT           optional default agent name for legacy single-gateway mode
  *
- * Header values are never accepted from tool parameters, so the model cannot
- * inject credentials or run arbitrary helper commands.
+ * Header values and helper commands are never accepted from tool parameters, so
+ * the model cannot inject credentials or run arbitrary helper commands.
  */
 
+import { dirname } from "node:path";
+
 import { cancelTask, discoverAgents, getAgentCard, getFile, getTask, sendFile, sendMessage, A2AError } from "./client.mjs";
+import {
+  ENV_CONFIG,
+  ENV_GATEWAY,
+  GATEWAY_NAME_PATTERN,
+  MAX_CONFIG_BYTES,
+  loadGatewayConfig,
+  normalizeGatewayUrl,
+  validateGatewayConfig,
+  validateGatewayName,
+} from "./gateways.mjs";
 import { resolveHeaders } from "./headers-helper.mjs";
 
 export const ENV_URL = "PI_A2A_URL";
 export const ENV_HEADERS_HELPER = "PI_A2A_HEADERS_HELPER";
 export const ENV_AGENT = "PI_A2A_AGENT";
+export { ENV_CONFIG, ENV_GATEWAY, GATEWAY_NAME_PATTERN, MAX_CONFIG_BYTES, loadGatewayConfig, validateGatewayConfig };
+
+/**
+ * @typedef {import("./gateways.mjs").GatewayInput} GatewayInput
+ * @typedef {import("./gateways.mjs").ResolvedGateway} ResolvedGateway
+ * @typedef {import("./gateways.mjs").LoadedGatewayConfig} LoadedGatewayConfig
+ */
 
 /**
  * @typedef {{
  *   baseUrl?: string;
- *   headersHelper?: string;
+ *   headersHelper?: string | string[];
  *   agent?: string;
+ *   gateway?: string;
+ *   gateways?: Record<string, GatewayInput>;
  *   env?: NodeJS.ProcessEnv;
  *   fetchImpl?: typeof fetch;
  * }} PiA2aOptions
@@ -50,16 +75,22 @@ export function readConfig(env = process.env) {
     baseUrl: trim(env[ENV_URL]),
     headersHelper: trim(env[ENV_HEADERS_HELPER]),
     agent: trim(env[ENV_AGENT]),
+    configPath: trim(env[ENV_CONFIG]),
+    gateway: trim(env[ENV_GATEWAY]),
   };
 }
 
+const gatewayProperty = {
+  type: "string",
+  description: `Named A2A gateway from a2a.json (or ${ENV_CONFIG}). Call a2a_gateways to list available gateways.`,
+};
 const urlProperty = {
   type: "string",
-  description: `A2A gateway base URL (https://…). Defaults to ${ENV_URL}.`,
+  description: `A2A gateway base URL (https://…). Defaults to ${ENV_URL}; omit when targeting a named gateway.`,
 };
 const agentProperty = {
   type: "string",
-  description: `Agent name under /a2a/{agent}. Omit to use ${ENV_AGENT} or the root agent.`,
+  description: `Agent name under /a2a/{agent}. Omit to use the gateway's default agent, ${ENV_AGENT}, or the root agent.`,
 };
 const fileNameProperty = {
   type: "string",
@@ -77,15 +108,21 @@ const streamProperty = {
  *
  * @param {{ taskId?: string; contextId?: string; state: string; text: string; error?: string }} result
  * @param {string} heading
+ * @param {string} [gateway]
  */
-export function formatResult(result, heading) {
+export function formatResult(result, heading, gateway) {
   const lines = [heading];
   lines.push(`state: ${result.state}`);
+  if (gateway) lines.push(`gateway: ${gateway}`);
   if (result.taskId) lines.push(`taskId: ${result.taskId}`);
   if (result.contextId) lines.push(`contextId: ${result.contextId}`);
   if (result.error) lines.push(`error: ${result.error}`);
   if (result.state === "input-required") {
-    lines.push("The agent needs more input. Continue with a2a_reply using this taskId.");
+    lines.push(
+      gateway
+        ? `The agent needs more input. Continue with a2a_reply using this taskId and gateway="${gateway}".`
+        : "The agent needs more input. Continue with a2a_reply using this taskId.",
+    );
   } else if (result.state === "reply_withheld") {
     lines.push("The agent withheld its reply (policy or safety filter). Do not retry with the same content.");
   }
@@ -99,9 +136,11 @@ export function formatResult(result, heading) {
  * Formats a single Agent Card summary for the model.
  *
  * @param {{ agent?: string; name: string; description?: string; version?: string; streaming: boolean; cardUrl: string; skills: Array<{ id?: string; name?: string; description?: string }> }} summary
+ * @param {string} [gateway]
  */
-export function formatCard(summary) {
+export function formatCard(summary, gateway) {
   const lines = [`A2A agent card: ${summary.agent ? `${summary.agent} — ` : ""}${summary.name}${summary.version ? ` v${summary.version}` : ""}`];
+  if (gateway) lines.push(`gateway: ${gateway}`);
   lines.push(`streaming: ${summary.streaming}`);
   if (summary.description) lines.push(summary.description);
   for (const skill of summary.skills.slice(0, 50)) {
@@ -114,9 +153,11 @@ export function formatCard(summary) {
  * Formats discovery output for the model.
  *
  * @param {Awaited<ReturnType<typeof discoverAgents>>} discovery
+ * @param {string} [gateway]
  */
-export function formatAgents(discovery) {
+export function formatAgents(discovery, gateway) {
   const lines = [`A2A agents at ${discovery.baseUrl}`];
+  if (gateway) lines.push(`gateway: ${gateway}`);
   for (const agent of discovery.agents) {
     const label = agent.agent ? `${agent.agent} — ${agent.name}` : `${agent.name} (root)`;
     lines.push(`- ${label}${agent.version ? ` v${agent.version}` : ""}${agent.streaming ? " [streaming]" : ""}`);
@@ -129,6 +170,126 @@ export function formatAgents(discovery) {
     lines.push("", `warnings: ${discovery.errors.join("; ")}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * Formats configured gateway inventory without revealing helper commands or credentials.
+ *
+ * @param {{
+ *   activeDefault: { kind: "named"; name: string } | { kind: "legacy" } | { kind: "none" };
+ *   gateways: Array<{ name: string; url: string; agent?: string; description?: string; auth: "configured" | "none"; isDefault: boolean }>;
+ *   legacy?: { url: string; agent?: string; auth: "configured" | "none"; isDefault: boolean };
+ * }} summary
+ */
+export function formatGateways(summary) {
+  const lines = [];
+  if (summary.gateways.length === 0) {
+    lines.push("No named A2A gateways configured.");
+  } else {
+    lines.push("Configured A2A gateways:");
+    for (const gw of summary.gateways) {
+      const meta = [];
+      if (gw.agent) meta.push(`agent: ${gw.agent}`);
+      meta.push(`auth: ${gw.auth}`);
+      const suffix = gw.description ? ` — ${gw.description}` : "";
+      lines.push(`- ${gw.name}${gw.isDefault ? " (default)" : ""}: ${gw.url} (${meta.join(", ")})${suffix}`);
+    }
+  }
+  if (summary.legacy) {
+    const meta = [];
+    if (summary.legacy.agent) meta.push(`agent: ${summary.legacy.agent}`);
+    meta.push(`auth: ${summary.legacy.auth}`);
+    lines.push(
+      `Legacy single-gateway (${ENV_URL})${summary.legacy.isDefault ? " (default)" : ""}: ${summary.legacy.url} (${meta.join(", ")})`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Sanitizes a legacy URL for display in `a2a_gateways` (strips userinfo, query, and fragment).
+ *
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+function sanitizeDisplayUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.origin}${pathname}`;
+  } catch {
+    return "(invalid URL)";
+  }
+}
+
+/**
+ * Parses `/a2a` slash command arguments.
+ *
+ * Supported forms:
+ * - `/a2a gateways`
+ * - `/a2a [-g <gw> | --gateway <gw>] [@agent] <message>`
+ * - `/a2a [-g <gw> | --gateway <gw>] card [@agent]`
+ * - `/a2a card [-g <gw> | --gateway <gw>] [@agent]`
+ *
+ * @param {string | undefined} args
+ * @returns {{ kind: "gateways" } | { kind: "card"; gateway?: string; agent?: string } | { kind: "send"; gateway?: string; agent?: string; message: string } | { kind: "error"; message: string }}
+ */
+export function parseSlashArgs(args) {
+  let rest = (args ?? "").trim();
+  if (rest === "gateways") {
+    return { kind: "gateways" };
+  }
+
+  /** @type {string | undefined} */
+  let gateway;
+
+  const consumeGateway = () => {
+    const match = /^(?:-g|--gateway)(?:\s+(\S+))?(?:\s+|$)/.exec(rest);
+    if (!match) return { consumed: false };
+    const value = match[1];
+    if (!value) {
+      return { error: "Usage: /a2a [-g <gateway>] [@agent] <message> | /a2a card [-g <gateway>] [@agent] | /a2a gateways" };
+    }
+    if (!GATEWAY_NAME_PATTERN.test(value)) {
+      return { error: `Invalid gateway name "${value}": must be 1-63 lowercase letters, digits, or '-'` };
+    }
+    gateway = value;
+    rest = rest.slice(match[0].length).trim();
+    return { consumed: true };
+  };
+
+  const firstGw = consumeGateway();
+  if (firstGw.error) return { kind: "error", message: firstGw.error };
+
+  let wantsCard = false;
+  if (/^card(?:\s|$)/.test(rest)) {
+    wantsCard = true;
+    rest = rest.slice(4).trim();
+  }
+
+  if (wantsCard && !gateway) {
+    const secondGw = consumeGateway();
+    if (secondGw.error) return { kind: "error", message: secondGw.error };
+  }
+
+  /** @type {string | undefined} */
+  let agent;
+  const agentMatch = /^@(\S+)(?:\s+|$)/.exec(rest);
+  if (agentMatch) {
+    agent = agentMatch[1];
+    rest = rest.slice(agentMatch[0].length).trim();
+  }
+
+  if (wantsCard) {
+    return { kind: "card", gateway, agent };
+  }
+  if (!rest) {
+    return {
+      kind: "error",
+      message: "Usage: /a2a [-g <gateway>] [@agent] <message> | /a2a card [-g <gateway>] [@agent] | /a2a gateways",
+    };
+  }
+  return { kind: "send", gateway, agent, message: rest };
 }
 
 /**
@@ -152,32 +313,70 @@ async function guard(run) {
 /**
  * Registers the A2A tools on a Pi ExtensionAPI.
  *
- * @param {{ registerTool: (tool: Record<string, unknown>) => void }} pi
+ * @param {{ registerTool: (tool: Record<string, unknown>) => void; registerCommand?: (name: string, cmd: Record<string, unknown>) => void }} pi
  * @param {PiA2aOptions} [options]  Overrides, mainly for tests.
  */
 export default function registerPiA2aExtension(pi, options = {}) {
   const env = options.env ?? process.env;
 
   /**
-   * Resolves per-call connection settings. Header values only come from the configured helper.
+   * Resolves a named gateway connection with strict URL binding and isolated credentials.
    *
-   * @param {{ url?: string; agent?: string }} params
+   * @param {string} name
+   * @param {LoadedGatewayConfig} loaded
+   * @param {string | undefined} requestedUrl
+   * @param {string | undefined} requestedAgent
    */
-  async function connection(params) {
-    const config = readConfig(env);
-    const configuredUrl = options.baseUrl || config.baseUrl;
-    const requestedUrl = params.url?.trim();
-    const baseUrl = requestedUrl || configuredUrl;
-    if (!baseUrl) {
-      throw new A2AError(`No A2A URL configured. Set ${ENV_URL} or pass the url parameter.`);
+  async function buildNamedConnection(name, loaded, requestedUrl, requestedAgent) {
+    validateGatewayName(name, "gateway");
+    const entry = Object.hasOwn(loaded.gateways, name) ? loaded.gateways[name] : undefined;
+    if (!entry) {
+      const available = Object.keys(loaded.gateways).sort();
+      throw new A2AError(
+        `Unknown A2A gateway "${name}". ${available.length > 0 ? `Configured gateways: ${available.join(", ")}.` : "No named gateways are configured."}`,
+      );
     }
-    const headersHelper = options.headersHelper ?? config.headersHelper;
-    if (headersHelper && requestedUrl) {
-      if (!configuredUrl) {
+    if (requestedUrl) {
+      let normalized;
+      try {
+        normalized = normalizeGatewayUrl(requestedUrl, "url parameter");
+      } catch {
         throw new A2AError(
-          `Refusing to send ${ENV_HEADERS_HELPER} credentials to a tool-supplied url when ${ENV_URL} is not configured.`,
+          `Refusing to override named gateway "${name}" URL; omit url or target another gateway.`,
         );
       }
+      if (normalized.url !== entry.url) {
+        throw new A2AError(
+          `Refusing to override named gateway "${name}" URL; omit url or target another gateway.`,
+        );
+      }
+    }
+    const helper = Array.isArray(entry.headersHelper) ? [...entry.headersHelper] : entry.headersHelper;
+    const helperCwd = loaded.configPath ? dirname(loaded.configPath) : (env.HOME?.trim() || undefined);
+    const headers = helper ? await resolveHeaders({ headersHelper: helper, env, cwd: helperCwd }) : {};
+    const agent = requestedAgent || entry.agent;
+    return {
+      gateway: name,
+      baseUrl: entry.url,
+      agent,
+      headers,
+      pinnedOrigin: entry.origin,
+      fetchImpl: options.fetchImpl,
+    };
+  }
+
+  /**
+   * Resolves a legacy single-gateway connection (`options.baseUrl` or `PI_A2A_URL`).
+   *
+   * @param {string} configuredUrl
+   * @param {string | string[] | undefined} headersHelper
+   * @param {string | undefined} defaultAgent
+   * @param {string | undefined} requestedUrl
+   * @param {string | undefined} requestedAgent
+   */
+  async function buildLegacyConnection(configuredUrl, headersHelper, defaultAgent, requestedUrl, requestedAgent) {
+    const baseUrl = requestedUrl || configuredUrl;
+    if (headersHelper && requestedUrl) {
       let configuredOrigin;
       let requestedOrigin;
       try {
@@ -192,56 +391,202 @@ export default function registerPiA2aExtension(pi, options = {}) {
         );
       }
     }
-    const agent = params.agent?.trim() || options.agent || config.agent;
+    const agent = requestedAgent || defaultAgent;
     const headers = headersHelper ? await resolveHeaders({ headersHelper, env }) : {};
-    // Defense in depth: the client re-checks that the target origin equals the configured one
-    // whenever credentials are attached.
-    const pinnedOrigin = headersHelper && configuredUrl ? configuredUrl : undefined;
-    return { baseUrl, agent, headers, pinnedOrigin, fetchImpl: options.fetchImpl };
+    const pinnedOrigin = headersHelper ? configuredUrl : undefined;
+    return {
+      gateway: undefined,
+      baseUrl,
+      agent,
+      headers,
+      pinnedOrigin,
+      fetchImpl: options.fetchImpl,
+    };
   }
 
   /**
-   * Handles `/a2a [@agent] <message>` and `/a2a card [@agent]`.
+   * Resolves per-call connection settings. Header values only come from configured helpers.
+   *
+   * Precedence:
+   * 1. params.gateway
+   * 2. options.gateway
+   * 3. options.baseUrl
+   * 4. env.PI_A2A_GATEWAY
+   * 5. env.PI_A2A_URL
+   * 6. configFile.defaultGateway
+   * 7. params.url (only if no legacy headersHelper is configured)
+   * 8. error
+   *
+   * @param {{ gateway?: string; url?: string; agent?: string }} params
+   */
+  async function connection(params) {
+    const config = readConfig(env);
+    const requestedGateway = params.gateway?.trim() || undefined;
+    const requestedUrl = params.url?.trim() || undefined;
+    const requestedAgent = params.agent?.trim() || undefined;
+    const optionsGateway = options.gateway?.trim() || undefined;
+    const optionsBaseUrl = options.baseUrl?.trim() || undefined;
+    const legacyHelper = options.headersHelper ?? config.headersHelper;
+    const legacyAgent = options.agent || config.agent;
+
+    if (requestedGateway) {
+      const loaded = loadGatewayConfig(env, options);
+      return buildNamedConnection(requestedGateway, loaded, requestedUrl, requestedAgent);
+    }
+
+    if (optionsGateway) {
+      const loaded = loadGatewayConfig(env, options);
+      return buildNamedConnection(optionsGateway, loaded, requestedUrl, requestedAgent);
+    }
+
+    if (optionsBaseUrl) {
+      return buildLegacyConnection(optionsBaseUrl, legacyHelper, legacyAgent, requestedUrl, requestedAgent);
+    }
+
+    if (config.gateway) {
+      const loaded = loadGatewayConfig(env, options);
+      return buildNamedConnection(config.gateway, loaded, requestedUrl, requestedAgent);
+    }
+
+    if (config.baseUrl) {
+      return buildLegacyConnection(config.baseUrl, legacyHelper, legacyAgent, requestedUrl, requestedAgent);
+    }
+
+    const loaded = loadGatewayConfig(env, options);
+    if (loaded.defaultGateway) {
+      return buildNamedConnection(loaded.defaultGateway, loaded, requestedUrl, requestedAgent);
+    }
+
+    if (requestedUrl) {
+      if (legacyHelper) {
+        throw new A2AError(
+          `Refusing to send ${ENV_HEADERS_HELPER} credentials to a tool-supplied url when ${ENV_URL} is not configured.`,
+        );
+      }
+      return {
+        gateway: undefined,
+        baseUrl: requestedUrl,
+        agent: requestedAgent || legacyAgent,
+        headers: {},
+        pinnedOrigin: undefined,
+        fetchImpl: options.fetchImpl,
+      };
+    }
+
+    const available = Object.keys(loaded.gateways).sort();
+    if (available.length > 0) {
+      throw new A2AError(
+        `No default A2A gateway configured. Pass gateway (configured: ${available.join(", ")}), set ${ENV_GATEWAY}, or set defaultGateway in your config.`,
+      );
+    }
+    throw new A2AError(`No A2A URL configured. Set ${ENV_URL}, configure ${ENV_CONFIG}, or pass the url parameter.`);
+  }
+
+  /**
+   * Builds the sanitized gateway inventory for `a2a_gateways` and `/a2a gateways`.
+   */
+  function listGatewaysSummary() {
+    const config = readConfig(env);
+    const loaded = loadGatewayConfig(env, options);
+    const optionsGateway = options.gateway?.trim() || undefined;
+    const optionsBaseUrl = options.baseUrl?.trim() || undefined;
+    const legacyUrl = optionsBaseUrl || config.baseUrl;
+    const legacyHelper = options.headersHelper ?? config.headersHelper;
+    const legacyAgent = options.agent || config.agent;
+
+    /** @type {{ kind: "named"; name: string } | { kind: "legacy" } | { kind: "none" }} */
+    let activeDefault = { kind: "none" };
+    if (optionsGateway) {
+      activeDefault = { kind: "named", name: optionsGateway };
+    } else if (optionsBaseUrl) {
+      activeDefault = { kind: "legacy" };
+    } else if (config.gateway) {
+      activeDefault = { kind: "named", name: config.gateway };
+    } else if (config.baseUrl) {
+      activeDefault = { kind: "legacy" };
+    } else if (loaded.defaultGateway) {
+      activeDefault = { kind: "named", name: loaded.defaultGateway };
+    }
+
+    const gateways = Object.keys(loaded.gateways)
+      .sort()
+      .map((name) => {
+        const entry = loaded.gateways[name];
+        return {
+          name,
+          url: entry.url,
+          ...(entry.agent ? { agent: entry.agent } : {}),
+          ...(entry.description ? { description: entry.description } : {}),
+          auth: /** @type {"configured" | "none"} */ (entry.headersHelper ? "configured" : "none"),
+          isDefault: activeDefault.kind === "named" && activeDefault.name === name,
+        };
+      });
+
+    const legacy = legacyUrl
+      ? {
+          url: sanitizeDisplayUrl(legacyUrl),
+          ...(legacyAgent ? { agent: legacyAgent } : {}),
+          auth: /** @type {"configured" | "none"} */ (legacyHelper ? "configured" : "none"),
+          isDefault: activeDefault.kind === "legacy",
+        }
+      : undefined;
+
+    return { activeDefault, gateways, ...(legacy ? { legacy } : {}) };
+  }
+
+  /**
+   * Handles `/a2a` slash commands.
    *
    * @param {string | undefined} args
    * @param {{ ui?: { notify?: (message: string, level?: string) => void } }} [ctx]
    */
   async function runSlashCommand(args, ctx) {
     const notify = (/** @type {string} */ message, level = "info") => ctx?.ui?.notify?.(message, level);
-    let rest = (args ?? "").trim();
-    let wantsCard = false;
-    if (/^card(\s|$)/.test(rest)) {
-      wantsCard = true;
-      rest = rest.slice(4).trim();
-    }
-    let agent;
-    const match = /^@(\S+)\s*/.exec(rest);
-    if (match) {
-      agent = match[1];
-      rest = rest.slice(match[0].length).trim();
-    }
-    if (!wantsCard && !rest) {
-      notify("Usage: /a2a [@agent] <message> | /a2a card [@agent]", "error");
+    const parsed = parseSlashArgs(args);
+    if (parsed.kind === "error") {
+      notify(parsed.message, "error");
       return;
     }
     const result = await guard(async () => {
-      const conn = await connection({ agent });
-      if (wantsCard) {
-        const summary = await getAgentCard({ ...conn });
-        return { text: formatCard(summary), details: summary };
+      if (parsed.kind === "gateways") {
+        const summary = listGatewaysSummary();
+        return { text: formatGateways(summary), details: summary };
       }
-      const sent = await sendMessage({ ...conn, message: rest });
-      return { text: formatResult(sent, "A2A message sent"), details: sent };
+      const conn = await connection({ gateway: parsed.gateway, agent: parsed.agent });
+      if (parsed.kind === "card") {
+        const summary = await getAgentCard({ ...conn });
+        return { text: formatCard(summary, conn.gateway), details: { ...(conn.gateway ? { gateway: conn.gateway } : {}), ...summary } };
+      }
+      const sent = await sendMessage({ ...conn, message: parsed.message });
+      return { text: formatResult(sent, "A2A message sent", conn.gateway), details: { ...(conn.gateway ? { gateway: conn.gateway } : {}), ...sent } };
     });
     notify(result.content[0].text, result.isError ? "error" : "info");
   }
 
   if (typeof pi.registerCommand === "function") {
     pi.registerCommand("a2a", {
-      description: "Send a message to an A2A agent: /a2a [@agent] <message>, or /a2a card [@agent]",
+      description: "Send a message to an A2A agent: /a2a [-g <gw>] [@agent] <message>, /a2a card [-g <gw>] [@agent], or /a2a gateways",
       handler: runSlashCommand,
     });
   }
+
+  pi.registerTool({
+    name: "a2a_gateways",
+    label: "A2A Gateways",
+    description:
+      "List configured named A2A gateways (names, URLs, default agents, descriptions, and whether auth is configured). Does not expose credentials or helper commands.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    async execute() {
+      return guard(async () => {
+        const summary = listGatewaysSummary();
+        return { text: formatGateways(summary), details: summary };
+      });
+    },
+  });
 
   pi.registerTool({
     name: "a2a_card",
@@ -250,15 +595,16 @@ export default function registerPiA2aExtension(pi, options = {}) {
       "Fetch one A2A agent's Agent Card (/a2a/{agent}/.well-known/agent.json, or the root card when no agent is given).",
     parameters: {
       type: "object",
-      properties: { agent: agentProperty, url: urlProperty },
+      properties: { gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
       additionalProperties: false,
     },
     async execute(_toolCallId, params, signal) {
       return guard(async () => {
         const conn = await connection(params ?? {});
         const summary = await getAgentCard({ ...conn, signal });
-        const { card, ...details } = summary;
-        return { text: formatCard(summary), details };
+        const { card, ...rest } = summary;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatCard(summary, conn.gateway), details };
       });
     },
   });
@@ -269,7 +615,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     description: "Get the current state, text, and artifacts of an A2A task (tasks/get).",
     parameters: {
       type: "object",
-      properties: { task_id: taskIdProperty, agent: agentProperty, url: urlProperty },
+      properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
       required: ["task_id"],
       additionalProperties: false,
     },
@@ -277,8 +623,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
       return guard(async () => {
         const conn = await connection(params);
         const result = await getTask(conn.baseUrl, { ...conn, taskId: params.task_id, signal });
-        const { raw, ...details } = result;
-        return { text: formatResult(result, "A2A task"), details };
+        const { raw, ...rest } = result;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatResult(result, "A2A task", conn.gateway), details };
       });
     },
   });
@@ -289,7 +636,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     description: "Cancel a running A2A task (tasks/cancel).",
     parameters: {
       type: "object",
-      properties: { task_id: taskIdProperty, agent: agentProperty, url: urlProperty },
+      properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
       required: ["task_id"],
       additionalProperties: false,
     },
@@ -297,8 +644,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
       return guard(async () => {
         const conn = await connection(params);
         const result = await cancelTask(conn.baseUrl, { ...conn, taskId: params.task_id, signal });
-        const { raw, ...details } = result;
-        return { text: formatResult(result, "A2A task cancel requested"), details };
+        const { raw, ...rest } = result;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatResult(result, "A2A task cancel requested", conn.gateway), details };
       });
     },
   });
@@ -316,6 +664,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
         content: { type: "string", description: "File content (UTF-8 text, or base64 when encoding=base64)." },
         encoding: { type: "string", enum: ["utf8", "base64"], description: "Content encoding. Default utf8." },
         content_type: { type: "string", description: "Optional MIME type. Default application/octet-stream." },
+        gateway: gatewayProperty,
         url: urlProperty,
       },
       required: ["task_id", "name", "content"],
@@ -349,9 +698,16 @@ export default function registerPiA2aExtension(pi, options = {}) {
           contentType: params.content_type,
           signal,
         });
+        const details = {
+          ...(conn.gateway ? { gateway: conn.gateway } : {}),
+          taskId: result.taskId,
+          name: result.name,
+          size: result.size,
+          status: result.status,
+        };
         return {
-          text: `A2A file staged: ${result.name} (${result.size} bytes) for task ${result.taskId}`,
-          details: { taskId: result.taskId, name: result.name, size: result.size, status: result.status },
+          text: `A2A file staged: ${result.name} (${result.size} bytes) for task ${result.taskId}${conn.gateway ? ` (gateway: ${conn.gateway})` : ""}`,
+          details,
         };
       });
     },
@@ -363,7 +719,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     description: "Download a staged task file (GET /files/{task_id}/{name}). Text is returned inline; binary files are returned as base64.",
     parameters: {
       type: "object",
-      properties: { task_id: taskIdProperty, name: fileNameProperty, url: urlProperty },
+      properties: { task_id: taskIdProperty, name: fileNameProperty, gateway: gatewayProperty, url: urlProperty },
       required: ["task_id", "name"],
       additionalProperties: false,
     },
@@ -384,9 +740,18 @@ export default function registerPiA2aExtension(pi, options = {}) {
         if (!isText) {
           body = file.content.toString("base64");
         }
+        const encoding = isText ? "utf8" : "base64";
+        const details = {
+          ...(conn.gateway ? { gateway: conn.gateway } : {}),
+          taskId: file.taskId,
+          name: file.name,
+          size: file.size,
+          contentType: file.contentType,
+          encoding,
+        };
         return {
-          text: `A2A file ${file.name} (${file.size} bytes, ${file.contentType}, ${isText ? "utf8" : "base64"})\n\n${body}`,
-          details: { taskId: file.taskId, name: file.name, size: file.size, contentType: file.contentType, encoding: isText ? "utf8" : "base64" },
+          text: `A2A file ${file.name} (${file.size} bytes, ${file.contentType}, ${encoding}${conn.gateway ? `, gateway: ${conn.gateway}` : ""})\n\n${body}`,
+          details,
         };
       });
     },
@@ -399,16 +764,18 @@ export default function registerPiA2aExtension(pi, options = {}) {
       "Discover A2A agents: fetches Agent Cards from /.well-known/agent.json and the /a2a directory, or a single agent's card when `agent` is given.",
     parameters: {
       type: "object",
-      properties: { url: urlProperty, agent: agentProperty },
+      properties: { gateway: gatewayProperty, url: urlProperty, agent: agentProperty },
       additionalProperties: false,
     },
     async execute(_toolCallId, params, signal) {
       return guard(async () => {
         const conn = await connection(params ?? {});
         const discovery = await discoverAgents({ ...conn, signal });
+        const rest = { baseUrl: discovery.baseUrl, agents: discovery.agents.map(({ card, ...item }) => item), errors: discovery.errors };
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
         return {
-          text: formatAgents(discovery),
-          details: { baseUrl: discovery.baseUrl, agents: discovery.agents.map(({ card, ...rest }) => rest), errors: discovery.errors },
+          text: formatAgents(discovery, conn.gateway),
+          details,
         };
       });
     },
@@ -423,6 +790,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
       type: "object",
       properties: {
         message: { type: "string", description: "Text to send to the agent." },
+        gateway: gatewayProperty,
         agent: agentProperty,
         url: urlProperty,
         context_id: contextIdProperty,
@@ -446,8 +814,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
             onUpdate({ content: [{ type: "text", text: progress }], details: { kind: event.kind, state: event.state } });
           },
         });
-        const { raw, events, ...details } = result;
-        return { text: formatResult(result, "A2A message sent"), details };
+        const { raw, events, ...rest } = result;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatResult(result, "A2A message sent", conn.gateway), details };
       });
     },
   });
@@ -458,7 +827,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     description: "Get the current state, text, and artifacts of an A2A task (tasks/get).",
     parameters: {
       type: "object",
-      properties: { task_id: taskIdProperty, agent: agentProperty, url: urlProperty },
+      properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
       required: ["task_id"],
       additionalProperties: false,
     },
@@ -466,8 +835,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
       return guard(async () => {
         const conn = await connection(params);
         const result = await getTask({ ...conn, taskId: params.task_id, signal });
-        const { raw, ...details } = result;
-        return { text: formatResult(result, "A2A task status"), details };
+        const { raw, ...rest } = result;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatResult(result, "A2A task status", conn.gateway), details };
       });
     },
   });
@@ -482,6 +852,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
       properties: {
         task_id: taskIdProperty,
         message: { type: "string", description: "Reply text for the waiting agent." },
+        gateway: gatewayProperty,
         agent: agentProperty,
         url: urlProperty,
         context_id: contextIdProperty,
@@ -506,8 +877,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
             onUpdate({ content: [{ type: "text", text: progress }], details: { kind: event.kind, state: event.state } });
           },
         });
-        const { raw, events, ...details } = result;
-        return { text: formatResult(result, "A2A reply sent"), details };
+        const { raw, events, ...rest } = result;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatResult(result, "A2A reply sent", conn.gateway), details };
       });
     },
   });
@@ -518,7 +890,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     description: "Cancel a running A2A task (tasks/cancel).",
     parameters: {
       type: "object",
-      properties: { task_id: taskIdProperty, agent: agentProperty, url: urlProperty },
+      properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
       required: ["task_id"],
       additionalProperties: false,
     },
@@ -526,8 +898,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
       return guard(async () => {
         const conn = await connection(params);
         const result = await cancelTask({ ...conn, taskId: params.task_id, signal });
-        const { raw, ...details } = result;
-        return { text: formatResult(result, "A2A task cancel requested"), details };
+        const { raw, ...rest } = result;
+        const details = conn.gateway ? { gateway: conn.gateway, ...rest } : rest;
+        return { text: formatResult(result, "A2A task cancel requested", conn.gateway), details };
       });
     },
   });

@@ -1,7 +1,8 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -31,7 +32,13 @@ import {
   splitCommandTokens,
   validateAndNormalizeHeaders,
 } from "../src/headers-helper.mjs";
-import registerPiA2aExtension, { readConfig } from "../src/extension.mjs";
+import registerPiA2aExtension, {
+  MAX_CONFIG_BYTES,
+  loadGatewayConfig,
+  parseSlashArgs,
+  readConfig,
+  validateGatewayConfig,
+} from "../src/extension.mjs";
 
 // ---------------------------------------------------------------------------
 // Mock A2A gateway
@@ -466,10 +473,17 @@ describe("message/stream SSE", () => {
 // ---------------------------------------------------------------------------
 
 describe("input-required + a2a_reply continuation", () => {
-  it("registers all ten tools, reading defaults from process.env", () => {
-    const saved = { url: process.env.PI_A2A_URL, helper: process.env.PI_A2A_HEADERS_HELPER };
+  it("registers all eleven tools, reading defaults from process.env", () => {
+    const saved = {
+      url: process.env.PI_A2A_URL,
+      helper: process.env.PI_A2A_HEADERS_HELPER,
+      config: process.env.PI_A2A_CONFIG,
+      gateway: process.env.PI_A2A_GATEWAY,
+    };
     process.env.PI_A2A_URL = baseUrl;
     delete process.env.PI_A2A_HEADERS_HELPER;
+    delete process.env.PI_A2A_CONFIG;
+    delete process.env.PI_A2A_GATEWAY;
     try {
       const pi = fakePi();
       registerPiA2aExtension(pi);
@@ -482,6 +496,7 @@ describe("input-required + a2a_reply continuation", () => {
         "a2a_cancel",
         "a2a_cancel_task",
         "a2a_card",
+        "a2a_gateways",
         "a2a_get_file",
         "a2a_get_task",
         "a2a_reply",
@@ -503,6 +518,8 @@ describe("input-required + a2a_reply continuation", () => {
       if (saved.url === undefined) delete process.env.PI_A2A_URL;
       else process.env.PI_A2A_URL = saved.url;
       if (saved.helper !== undefined) process.env.PI_A2A_HEADERS_HELPER = saved.helper;
+      if (saved.config !== undefined) process.env.PI_A2A_CONFIG = saved.config;
+      if (saved.gateway !== undefined) process.env.PI_A2A_GATEWAY = saved.gateway;
     }
   });
 
@@ -1054,4 +1071,513 @@ it("package.json pi.extensions manifest resolves to an extension factory functio
     mod.default(pi, { env: { PI_A2A_URL: baseUrl } });
     assert.ok(pi.tools.size > 0);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 10. Named gateways
+// ---------------------------------------------------------------------------
+
+describe("named gateways", () => {
+  /** @type {http.Server} */
+  let secondServer;
+  let secondBaseUrl = "";
+  /** @type {Array<{ method: string; path: string; headers: http.IncomingHttpHeaders }>} */
+  const secondRequests = [];
+  let tmpDir = "";
+  let alphaHelperPath = "";
+  let betaHelperPath = "";
+  let legacyHelperMarker = "";
+  let legacyHelperPath = "";
+
+  before(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-a2a-gateways-"));
+    alphaHelperPath = join(tmpDir, "alpha-helper.mjs");
+    betaHelperPath = join(tmpDir, "beta-helper.mjs");
+    legacyHelperPath = join(tmpDir, "legacy-helper.mjs");
+    legacyHelperMarker = join(tmpDir, "legacy-ran.txt");
+
+    writeFileSync(
+      alphaHelperPath,
+      'process.stdout.write(JSON.stringify({ authorization: "Bearer alpha-secret-token" }));\n',
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      betaHelperPath,
+      'process.stdout.write(JSON.stringify({ authorization: "Bearer beta-secret-token" }));\n',
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      legacyHelperPath,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(legacyHelperMarker)}, "ran");\nprocess.stdout.write(JSON.stringify({ authorization: "Bearer legacy-secret-token" }));\n`,
+      { mode: 0o600 },
+    );
+
+    secondServer = http.createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      secondRequests.push({ method: req.method ?? "GET", path: url.pathname, headers: req.headers });
+      if (req.method === "GET" && url.pathname.endsWith("/.well-known/agent.json")) {
+        return json(res, 200, {
+          name: "SecondGateway",
+          description: "Isolated second gateway",
+          version: "3.0.0",
+          capabilities: { streaming: false },
+          skills: [{ id: "remote", name: "Remote" }],
+        });
+      }
+      if (req.method === "GET" && url.pathname === "/a2a") {
+        return json(res, 200, { agents: ["worker"] });
+      }
+      if (req.method === "POST") {
+        const body = JSON.parse(await readBody(req));
+        if (body.method === "message/send") {
+          const msg = body.params?.message?.parts?.[0]?.text ?? "";
+          return rpcResult(res, body.id, {
+            id: "second-task-1",
+            contextId: "second-ctx-1",
+            status: {
+              state: "completed",
+              message: { role: "agent", parts: text(`second:${msg}`) },
+            },
+          });
+        }
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolveListen) => {
+      secondServer.listen(0, "127.0.0.1", () => {
+        const addr = secondServer.address();
+        if (addr && typeof addr === "object") {
+          secondBaseUrl = `http://127.0.0.1:${addr.port}`;
+        }
+        resolveListen(undefined);
+      });
+    });
+  });
+
+  after(async () => {
+    if (secondServer) {
+      await new Promise((r) => secondServer.close(r));
+    }
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  function writeCfg(name, obj, mode = 0o600) {
+    const file = join(tmpDir, name);
+    writeFileSync(file, JSON.stringify(obj), { mode });
+    chmodSync(file, mode);
+    return file;
+  }
+
+  it("isolates credentials, URLs, and default agents across multiple named gateways", async () => {
+    const cfgPath = writeCfg("multi.json", {
+      defaultGateway: "alpha",
+      gateways: {
+        alpha: {
+          url: baseUrl,
+          headersHelper: [process.execPath, alphaHelperPath],
+          agent: "clerk",
+          description: "Primary clerk gateway",
+        },
+        beta: {
+          url: secondBaseUrl,
+          headersHelper: [process.execPath, betaHelperPath],
+          agent: "worker",
+          description: "Secondary worker gateway",
+        },
+        open: {
+          url: secondBaseUrl,
+          description: "Unauthenticated loopback gateway",
+        },
+      },
+    });
+
+    const pi = fakePi();
+    registerPiA2aExtension(pi, {
+      env: {
+        PI_A2A_CONFIG: cfgPath,
+        PI_A2A_HEADERS_HELPER: `${process.execPath} ${legacyHelperPath}`,
+        PI_A2A_AGENT: "echo",
+      },
+    });
+
+    // 1. Default named gateway ("alpha") hits baseUrl with alpha token and clerk agent -> input-required
+    const alphaReqStart = requests.length;
+    const first = await pi.tools.get("a2a_send").execute("gw-1", { message: "Need help" });
+    assert.notEqual(first.isError, true);
+    assert.equal(first.details.gateway, "alpha");
+    assert.equal(first.details.state, "input-required");
+    assert.match(first.content[0].text, /gateway: alpha/);
+    assert.match(first.content[0].text, /gateway="alpha"/);
+    assert.equal(requests[alphaReqStart].headers.authorization, "Bearer alpha-secret-token");
+    assert.equal(requests[alphaReqStart].path, "/a2a/clerk");
+
+    // 2. Explicit gateway ("beta") hits secondBaseUrl with beta token and worker agent
+    const betaReqStart = secondRequests.length;
+    const second = await pi.tools.get("a2a_send").execute("gw-2", { gateway: "beta", message: "ping" });
+    assert.notEqual(second.isError, true);
+    assert.equal(second.details.gateway, "beta");
+    assert.match(second.content[0].text, /second:ping/);
+    assert.equal(secondRequests[betaReqStart].headers.authorization, "Bearer beta-secret-token");
+    assert.equal(secondRequests[betaReqStart].path, "/a2a/worker");
+
+    // 3. Named gateway without headersHelper sends NO authorization header and never runs legacy helper or inherits PI_A2A_AGENT
+    const openReqStart = secondRequests.length;
+    const third = await pi.tools.get("a2a_send").execute("gw-3", { gateway: "open", message: "public" });
+    assert.notEqual(third.isError, true);
+    assert.equal(third.details.gateway, "open");
+    assert.equal(secondRequests[openReqStart].headers.authorization, undefined);
+    assert.equal(secondRequests[openReqStart].path, "/");
+    assert.equal(existsSync(legacyHelperMarker), false, "legacy helper must not execute for named gateway");
+
+    // 4. File staging tools carry gateway attribution
+    const staged = await pi.tools.get("a2a_send_file").execute("gw-4", {
+      gateway: "alpha",
+      task_id: "task-gw-file",
+      name: "note.txt",
+      content: "hello",
+    });
+    assert.notEqual(staged.isError, true);
+    assert.equal(staged.details.gateway, "alpha");
+    assert.match(staged.content[0].text, /\(gateway: alpha\)/);
+
+    const downloaded = await pi.tools.get("a2a_get_file").execute("gw-5", {
+      gateway: "alpha",
+      task_id: "task-gw-file",
+      name: "note.txt",
+    });
+    assert.notEqual(downloaded.isError, true);
+    assert.equal(downloaded.details.gateway, "alpha");
+    assert.match(downloaded.content[0].text, /gateway: alpha/);
+  });
+
+  it("preserves precedence: explicit env/options beat file defaultGateway", async () => {
+    const cfgPath = writeCfg("prec.json", {
+      defaultGateway: "beta",
+      gateways: {
+        alpha: { url: baseUrl, agent: "echo" },
+        beta: { url: secondBaseUrl },
+      },
+    });
+
+    // Legacy PI_A2A_URL beats file defaultGateway (unchanged legacy behavior)
+    const piLegacyWins = fakePi();
+    registerPiA2aExtension(piLegacyWins, {
+      env: { PI_A2A_CONFIG: cfgPath, PI_A2A_URL: baseUrl, PI_A2A_AGENT: "echo" },
+    });
+    const legacyCall = await piLegacyWins.tools.get("a2a_send").execute("p-1", { message: "hello" });
+    assert.notEqual(legacyCall.isError, true);
+    assert.equal(legacyCall.details.gateway, undefined);
+    assert.doesNotMatch(legacyCall.content[0].text, /gateway:/);
+    assert.match(legacyCall.content[0].text, /echo: hello/);
+
+    // Explicit params.gateway still reaches beta even when PI_A2A_URL is set
+    const explicitBeta = await piLegacyWins.tools.get("a2a_send").execute("p-2", { gateway: "beta", message: "hi" });
+    assert.notEqual(explicitBeta.isError, true);
+    assert.equal(explicitBeta.details.gateway, "beta");
+    assert.match(explicitBeta.content[0].text, /second:hi/);
+
+    // PI_A2A_GATEWAY beats PI_A2A_URL and ignores PI_A2A_AGENT
+    const piEnvGwWins = fakePi();
+    registerPiA2aExtension(piEnvGwWins, {
+      env: { PI_A2A_CONFIG: cfgPath, PI_A2A_URL: baseUrl, PI_A2A_AGENT: "clerk", PI_A2A_GATEWAY: "beta" },
+    });
+    const envGwStart = secondRequests.length;
+    const envGwCall = await piEnvGwWins.tools.get("a2a_send").execute("p-3", { message: "via-env-gw" });
+    assert.notEqual(envGwCall.isError, true);
+    assert.equal(envGwCall.details.gateway, "beta");
+    assert.equal(secondRequests[envGwStart].path, "/");
+
+    // options.baseUrl beats PI_A2A_GATEWAY
+    const piOptUrlWins = fakePi();
+    registerPiA2aExtension(piOptUrlWins, {
+      baseUrl,
+      agent: "echo",
+      env: { PI_A2A_CONFIG: cfgPath, PI_A2A_GATEWAY: "beta" },
+    });
+    const optUrlCall = await piOptUrlWins.tools.get("a2a_send").execute("p-4", { message: "opt-url" });
+    assert.notEqual(optUrlCall.isError, true);
+    assert.equal(optUrlCall.details.gateway, undefined);
+    assert.match(optUrlCall.content[0].text, /echo: opt-url/);
+
+    // Invalid PI_A2A_GATEWAY fails default call, but explicit params.gateway still succeeds
+    const piBadEnvGw = fakePi();
+    registerPiA2aExtension(piBadEnvGw, {
+      env: { PI_A2A_CONFIG: cfgPath, PI_A2A_GATEWAY: "nonexistent" },
+    });
+    const badDefault = await piBadEnvGw.tools.get("a2a_send").execute("p-5", { message: "fail" });
+    assert.equal(badDefault.isError, true);
+    assert.match(badDefault.content[0].text, /Unknown A2A gateway "nonexistent"/);
+    const okExplicit = await piBadEnvGw.tools.get("a2a_send").execute("p-6", { gateway: "beta", message: "ok" });
+    assert.notEqual(okExplicit.isError, true);
+    assert.equal(okExplicit.details.gateway, "beta");
+  });
+
+  it("refuses cross-origin AND same-origin different-path url overrides on named gateways", async () => {
+    const pi = fakePi();
+    registerPiA2aExtension(pi, {
+      gateways: {
+        sumac: {
+          url: `${baseUrl}/sumac`,
+          headersHelper: [process.execPath, alphaHelperPath],
+        },
+        coder: {
+          url: `${baseUrl}/coder`,
+        },
+      },
+      gateway: "sumac",
+      env: {},
+    });
+
+    const crossOrigin = await pi.tools.get("a2a_card").execute("u-1", {
+      gateway: "sumac",
+      url: secondBaseUrl,
+    });
+    assert.equal(crossOrigin.isError, true);
+    assert.match(crossOrigin.content[0].text, /Refusing to override named gateway "sumac"/);
+
+    const sameOriginDiffPath = await pi.tools.get("a2a_card").execute("u-2", {
+      gateway: "sumac",
+      url: `${baseUrl}/coder`,
+    });
+    assert.equal(sameOriginDiffPath.isError, true);
+    assert.match(sameOriginDiffPath.content[0].text, /Refusing to override named gateway "sumac"/);
+
+    const implicitDiffPath = await pi.tools.get("a2a_card").execute("u-3", {
+      url: `${baseUrl}/coder`,
+    });
+    assert.equal(implicitDiffPath.isError, true);
+    assert.match(implicitDiffPath.content[0].text, /Refusing to override named gateway "sumac"/);
+  });
+
+  it("a2a_gateways lists configured gateways accurately without revealing helper commands or secrets", async () => {
+    const cfgPath = writeCfg("inventory.json", {
+      defaultGateway: "beta",
+      gateways: {
+        alpha: {
+          url: baseUrl,
+          headersHelper: [process.execPath, alphaHelperPath, "--secret-flag-never-shown"],
+          agent: "echo",
+          description: "Alpha gateway",
+        },
+        beta: {
+          url: secondBaseUrl,
+          description: "Beta gateway",
+        },
+      },
+    });
+
+    const pi = fakePi();
+    registerPiA2aExtension(pi, {
+      env: {
+        PI_A2A_CONFIG: cfgPath,
+        PI_A2A_URL: `${baseUrl}/?leaked=query`,
+      },
+    });
+
+    const res = await pi.tools.get("a2a_gateways").execute("inv-1", {});
+    assert.notEqual(res.isError, true);
+    const out = res.content[0].text;
+    assert.match(out, /alpha: .*agent: echo, auth: configured.*Alpha gateway/);
+    assert.match(out, /beta: .*auth: none.*Beta gateway/);
+    assert.match(out, /Legacy single-gateway \(PI_A2A_URL\) \(default\):/);
+    assert.doesNotMatch(out, /beta \(default\)/);
+    assert.doesNotMatch(out, /alpha-helper/);
+    assert.doesNotMatch(out, /secret-flag-never-shown/);
+    assert.doesNotMatch(out, /leaked=query/);
+    assert.equal(res.details.activeDefault.kind, "legacy");
+    assert.equal(JSON.stringify(res.details).includes("secret-flag-never-shown"), false);
+  });
+
+  it("enforces config file trust checks, strict schema, and secret-safe errors", async () => {
+    // 1. Missing or relative explicit PI_A2A_CONFIG fails closed without crashing registration
+    const piMissing = fakePi();
+    registerPiA2aExtension(piMissing, { env: { PI_A2A_CONFIG: join(tmpDir, "does-not-exist.json") } });
+    const missingRes = await piMissing.tools.get("a2a_gateways").execute("c-1", {});
+    assert.equal(missingRes.isError, true);
+    assert.match(missingRes.content[0].text, /ENOENT/);
+    assert.throws(() => loadGatewayConfig({ PI_A2A_CONFIG: "./a2a.json" }), /must be an absolute path/);
+
+    // 2. Default path loading from PI_CODING_AGENT_DIR, symlink to regular file, and PI_A2A_CONFIG precedence
+    const agentDir = join(tmpDir, "agent-dir");
+    mkdirSync(agentDir, { mode: 0o700 });
+    const realTarget = writeCfg("real-target.json", {
+      defaultGateway: "beta",
+      gateways: { beta: { url: secondBaseUrl } },
+    });
+    symlinkSync(realTarget, join(agentDir, "a2a.json"));
+    const loadedSymlink = loadGatewayConfig({ PI_CODING_AGENT_DIR: agentDir });
+    assert.equal(loadedSymlink.source, "default-file");
+    assert.equal(loadedSymlink.defaultGateway, "beta");
+
+    const explicitOverride = writeCfg("explicit-override.json", {
+      defaultGateway: "alpha",
+      gateways: { alpha: { url: baseUrl } },
+    });
+    const loadedExplicit = loadGatewayConfig({
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_A2A_CONFIG: explicitOverride,
+    });
+    assert.equal(loadedExplicit.source, "env");
+    assert.equal(loadedExplicit.defaultGateway, "alpha");
+
+    // 3. Dangling symlink at default path acts as ENOENT
+    const danglingDir = join(tmpDir, "dangling-dir");
+    mkdirSync(danglingDir, { mode: 0o700 });
+    symlinkSync(join(tmpDir, "missing-target.json"), join(danglingDir, "a2a.json"));
+    const loadedDangling = loadGatewayConfig({ PI_CODING_AGENT_DIR: danglingDir });
+    assert.equal(loadedDangling.source, "none");
+
+    // 4. Group-writable, world-writable, and FIFO paths rejected on POSIX without blocking
+    if (process.platform !== "win32") {
+      const groupWritable = writeCfg("group-writable.json", { gateways: { a: { url: baseUrl } } }, 0o660);
+      assert.throws(() => loadGatewayConfig({ PI_A2A_CONFIG: groupWritable }), /group- or world-writable/);
+
+      const worldWritable = writeCfg("world-writable.json", { gateways: { a: { url: baseUrl } } }, 0o646);
+      assert.throws(() => loadGatewayConfig({ PI_A2A_CONFIG: worldWritable }), /group- or world-writable/);
+
+      const fifoPath = join(tmpDir, "config.fifo");
+      execFileSync("mkfifo", [fifoPath]);
+      assert.throws(() => loadGatewayConfig({ PI_A2A_CONFIG: fifoPath }), /regular file/);
+    }
+
+    // 5. Oversize config rejected
+    const bigFile = join(tmpDir, "oversize.json");
+    writeFileSync(bigFile, " ".repeat(MAX_CONFIG_BYTES + 10), { mode: 0o600 });
+    assert.throws(() => loadGatewayConfig({ PI_A2A_CONFIG: bigFile }), /exceeds maximum size/);
+
+    // 6. Directory path rejected
+    assert.throws(() => loadGatewayConfig({ PI_A2A_CONFIG: agentDir }), /regular file/);
+
+    // 7. Invalid JSON never echoes pasted secret text
+    const badJsonFile = join(tmpDir, "bad.json");
+    writeFileSync(badJsonFile, '{ "token": "TOP_SECRET_PASTED_VALUE" invalid', { mode: 0o600 });
+    assert.throws(
+      () => loadGatewayConfig({ PI_A2A_CONFIG: badJsonFile }),
+      (err) => err instanceof A2AError && /Invalid JSON/.test(err.message) && !err.message.includes("TOP_SECRET_PASTED_VALUE"),
+    );
+
+    // 8. Secret / unknown keys, query/hash URLs, relative helper paths, control chars, prototype names
+    assert.throws(
+      () => validateGatewayConfig({ gateways: { a: { url: baseUrl, headers: { authorization: "Bearer x" } } } }),
+      /Unknown key "headers"/,
+    );
+    assert.throws(
+      () => validateGatewayConfig({ gateways: { a: { url: `${baseUrl}/?token=secret` } } }),
+      (err) => err instanceof A2AError && /query parameters or a fragment/.test(err.message) && !err.message.includes("secret"),
+    );
+    assert.throws(
+      () => validateGatewayConfig({ gateways: { a: { url: baseUrl, headersHelper: "./local-helper.sh" } } }),
+      /relative paths are not allowed/,
+    );
+    assert.throws(
+      () => validateGatewayConfig({ gateways: { a: { url: baseUrl, headersHelper: ["../evil", "arg"] } } }),
+      /relative paths are not allowed/,
+    );
+    assert.throws(
+      () => validateGatewayConfig({ gateways: { a: { url: baseUrl, description: "line1\nfake: header" } } }),
+      /control characters or newlines/,
+    );
+    assert.throws(
+      () => validateGatewayConfig(JSON.parse('{"gateways":{"__proto__":{"url":"https://a.example"}}}'), "test"),
+      /Invalid gateway name/,
+    );
+
+    // Valid Object.prototype-colliding names like "constructor" work safely in null-prototype registry
+    const protoSafe = validateGatewayConfig({
+      defaultGateway: "constructor",
+      gateways: {
+        constructor: { url: baseUrl, headersHelper: "bare-cmd-on-path" },
+      },
+    });
+    assert.equal(protoSafe.defaultGateway, "constructor");
+    assert.equal(protoSafe.gateways.constructor.url, baseUrl);
+  });
+
+  it("/a2a slash command supports gateways listing, -g/--gateway flags, and preserves free-text messages", async () => {
+    assert.deepEqual(parseSlashArgs("gateways"), { kind: "gateways" });
+    assert.deepEqual(parseSlashArgs("gateways are down"), {
+      kind: "send",
+      gateway: undefined,
+      agent: undefined,
+      message: "gateways are down",
+    });
+    assert.deepEqual(parseSlashArgs("-g beta @worker check status"), {
+      kind: "send",
+      gateway: "beta",
+      agent: "worker",
+      message: "check status",
+    });
+    assert.deepEqual(parseSlashArgs("card --gateway beta @worker"), {
+      kind: "card",
+      gateway: "beta",
+      agent: "worker",
+    });
+    assert.equal(parseSlashArgs("-g").kind, "error");
+    assert.equal(parseSlashArgs("-g BAD_NAME hello").kind, "error");
+
+    const commands = new Map();
+    const pi = { registerTool() {}, registerCommand: (n, c) => commands.set(n, c) };
+    registerPiA2aExtension(pi, {
+      gateways: {
+        alpha: { url: baseUrl, agent: "echo" },
+        beta: { url: secondBaseUrl, agent: "worker" },
+      },
+      gateway: "alpha",
+      env: {},
+    });
+    const notices = [];
+    const ctx = { ui: { notify: (msg, level) => notices.push({ msg, level }) } };
+
+    await commands.get("a2a").handler("gateways", ctx);
+    assert.equal(notices.at(-1).level, "info");
+    assert.match(notices.at(-1).msg, /alpha \(default\)/);
+    assert.match(notices.at(-1).msg, /beta:/);
+
+    await commands.get("a2a").handler("-g beta ping", ctx);
+    assert.equal(notices.at(-1).level, "info");
+    assert.match(notices.at(-1).msg, /gateway: beta/);
+    assert.match(notices.at(-1).msg, /second:ping/);
+
+    await commands.get("a2a").handler("card --gateway beta @worker", ctx);
+    assert.equal(notices.at(-1).level, "info");
+    assert.match(notices.at(-1).msg, /gateway: beta/);
+    assert.match(notices.at(-1).msg, /SecondGateway/);
+  });
+
+  it("runs named-gateway headersHelper with cwd pinned to the config directory, not process.cwd()", async () => {
+    const cfgDir = join(tmpDir, "helper-cwd-dir");
+    mkdirSync(cfgDir, { mode: 0o700 });
+    const cwdLogPath = join(cfgDir, "observed-cwd.txt");
+    const cwdProbe = join(cfgDir, "cwd-probe.mjs");
+    writeFileSync(
+      cwdProbe,
+      `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(cwdLogPath)}, process.cwd());\nprocess.stdout.write(JSON.stringify({ authorization: "Bearer cwd-ok" }));\n`,
+      { mode: 0o600 },
+    );
+    const cfgFile = join(cfgDir, "a2a.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        defaultGateway: "beta",
+        gateways: {
+          beta: {
+            url: secondBaseUrl,
+            headersHelper: [process.execPath, "./cwd-probe.mjs"],
+          },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    chmodSync(cfgFile, 0o600);
+
+    const pi = fakePi();
+    registerPiA2aExtension(pi, { env: { PI_A2A_CONFIG: cfgFile } });
+    const res = await pi.tools.get("a2a_send").execute("cwd-1", { message: "check-cwd" });
+    assert.notEqual(res.isError, true);
+    assert.equal(realpathSync(readFileSync(cwdLogPath, "utf8")), realpathSync(cfgDir));
+  });
 });

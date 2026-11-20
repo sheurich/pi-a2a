@@ -11,6 +11,7 @@
       "default": "./src/extension.mjs"
     },
     "./client": "./src/client.mjs",
+    "./gateways": "./src/gateways.mjs",
     "./headers-helper": "./src/headers-helper.mjs",
     "./extension": "./src/extension.mjs"
   },

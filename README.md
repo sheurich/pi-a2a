@@ -4,7 +4,7 @@ Pi extension for discovering and talking to [A2A](https://a2a-protocol.org) agen
 
 ## Overview
 
-`pi-a2a` gives Pi ten tools that let the model find remote agents behind an A2A gateway, send them work, stream their replies, answer their follow-up questions, and check or cancel tasks. It has zero runtime dependencies: everything is built on Node's `fetch`, `node:http`, and `node:child_process`.
+`pi-a2a` gives Pi eleven tools that let the model discover configured gateways and remote agents, send them work, stream their replies, answer their follow-up questions, stage files, and check or cancel tasks. It has zero runtime dependencies: everything is built on Node's `fetch`, `node:http`, `node:fs`, and `node:child_process`.
 
 Security defaults:
 
@@ -24,15 +24,49 @@ Install the package with `pi install npm:@sheurich/pi-a2a` (or `pi install git:g
 }
 ```
 
-Then configure the gateway through environment variables:
+Then configure one or more gateways via a user-level JSON config file (`~/.pi/agent/a2a.json`, or `PI_A2A_CONFIG`) and/or environment variables:
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `PI_A2A_URL` | yes* | Base URL of the A2A gateway, e.g. `https://agents.example.com`. Agents are expected under `/a2a/{agent}`; the root agent is served from the base URL itself. |
-| `PI_A2A_HEADERS_HELPER` | no | Command that prints authentication headers to stdout, either as a JSON object or as `Header: value` lines. Run with `execFile` (no shell), a 10 s timeout, and a 64 KiB output cap. Only `authorization` and `x-goog-iap-jwt-assertion` are accepted. |
-| `PI_A2A_AGENT` | no | Default agent name used when a tool call does not specify one. |
+| `PI_A2A_CONFIG` | no | Explicit absolute path to a JSON gateway config file. When unset, `$PI_CODING_AGENT_DIR/a2a.json` (or `$HOME/.pi/agent/a2a.json`) is loaded if present. Project/working directories are never searched. |
+| `PI_A2A_GATEWAY` | no | Default named gateway from the config file when a tool call omits `gateway`. |
+| `PI_A2A_URL` | yes* | Legacy base URL of a single A2A gateway, e.g. `https://agents.example.com`. Agents are expected under `/a2a/{agent}`; the root agent is served from the base URL itself. |
+| `PI_A2A_HEADERS_HELPER` | no | Command that prints authentication headers to stdout for legacy `PI_A2A_URL` mode, either as a JSON object or as `Header: value` lines. Run with `execFile` (no shell), a 10 s timeout, and a 64 KiB output cap. Only `authorization` and `x-goog-iap-jwt-assertion` are accepted. |
+| `PI_A2A_AGENT` | no | Default agent name used in legacy `PI_A2A_URL` mode when a tool call does not specify one. |
 
-\* The model may also pass `url` per call; it still has to satisfy the HTTPS rule.
+\* The model may also pass `gateway` (targeting a configured named gateway) or `url` per call (when no legacy `headersHelper` is configured); every URL still has to satisfy the HTTPS/loopback rule.
+
+### Named gateways (`a2a.json`)
+
+Configure multiple independent A2A gateways in `~/.pi/agent/a2a.json` (or the path in `PI_A2A_CONFIG`) so one Pi session can talk to different origins with isolated credentials:
+
+```json
+{
+  "defaultGateway": "sumac",
+  "gateways": {
+    "sumac": {
+      "url": "https://agents.example.com/a2a",
+      "headersHelper": "/usr/local/bin/sumac-headers",
+      "description": "Sumac A2A gateway"
+    },
+    "coder": {
+      "url": "http://127.0.0.1:18081",
+      "headersHelper": ["/usr/local/bin/coder-a2a-headers", "--workspace", "dev"],
+      "agent": "worker",
+      "description": "Loopback SSH-forwarded Coder workspace"
+    }
+  }
+}
+```
+
+Gateway config rules and security invariants:
+
+- **Strict schema:** Top-level keys are `gateways` (required, up to 64 entries) and `defaultGateway` (optional, must exist in `gateways`). Gateway names match `[a-z0-9][a-z0-9-]{0,62}`. Each entry accepts only `url` (required, HTTPS or loopback HTTP, no query/fragment/userinfo), `headersHelper` (optional string or string array), `agent` (optional), and `description` (optional, max 256 chars, no control characters). Static `headers` or secret keys are rejected.
+- **File trust checks:** Config files are opened non-blockingly (`O_RDONLY | O_NONBLOCK` → `fstat` → bounded 64 KiB `read`) to avoid TOCTOU races and FIFO hangs. Non-regular files are rejected; on POSIX, the resolved file must be owned by the current user and not group- or world-writable (`mode & 0o022`). (Parent directory permissions are not checked, and mode/ownership checks are skipped on Windows.) An explicit `PI_A2A_CONFIG` must be an absolute path and fails closed if missing or invalid; a dangling symlink at the default `~/.pi/agent/a2a.json` path behaves as absent (`ENOENT`).
+- **Executable path safety:** Relative `headersHelper` executables containing `/` or `\` are rejected (use absolute paths or bare `PATH` command names), and named-gateway helpers execute with `cwd` set to the config file's directory (or `$HOME` for programmatic gateways) rather than the active project working directory.
+- **Credential & origin isolation:** Named gateways never inherit `PI_A2A_URL`, `PI_A2A_HEADERS_HELPER`, or `PI_A2A_AGENT`. Passing a different `url` alongside a named gateway (even same-origin with a different path) is refused, and `pinnedOrigin` is always enforced at the client layer.
+- **Precedence when `gateway` is omitted:** `options.gateway` → `options.baseUrl` → `PI_A2A_GATEWAY` → `PI_A2A_URL` → `a2a.json` `defaultGateway` → ad-hoc `url` (only when no legacy `headersHelper` is configured). This keeps existing `PI_A2A_URL` setups unchanged when `a2a.json` is added.
+- **Multi-gateway reach tradeoff:** Any gateway listed in `a2a.json` is reachable by the model via `gateway: "<name>"` (and can invoke that gateway's `headersHelper`). Only configure gateways you intend the active Pi session to reach.
 
 Example:
 
@@ -52,22 +86,23 @@ process.stdout.write(JSON.stringify({ authorization: `Bearer ${process.env.MY_TO
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `a2a_agents` | `url?`, `agent?` | Fetches `GET /.well-known/agent.json` and the `GET /a2a` directory (or a single `GET /a2a/{agent}/.well-known/agent.json`) and lists names, versions, streaming support, and skills. |
-| `a2a_send` | `message`, `agent?`, `url?`, `context_id?`, `stream?` | Starts a task with `message/send`, or `message/stream` (SSE) when `stream` is true. Returns `taskId`, `contextId`, `state`, and the agent's text. |
-| `a2a_status` | `task_id`, `agent?`, `url?` | Calls `tasks/get` and returns the current state, artifacts, and latest agent message. |
-| `a2a_reply` | `task_id`, `message`, `agent?`, `url?`, `context_id?`, `stream?` | Continues a task that is in `input-required` by sending another user message with the same `taskId`. |
-| `a2a_cancel` | `task_id`, `agent?`, `url?` | Calls `tasks/cancel`. |
-| `a2a_card` | `agent?`, `url?` | Fetches one agent's card from `/a2a/{agent}/.well-known/agent.json` (root card without `agent`). |
-| `a2a_get_task` | `task_id`, `agent?`, `url?` | Calls `tasks/get` on `/a2a/{agent}`. |
-| `a2a_cancel_task` | `task_id`, `agent?`, `url?` | Calls `tasks/cancel` on `/a2a/{agent}`. |
-| `a2a_send_file` | `task_id`, `name`, `content`, `encoding?`, `content_type?`, `url?` | Stages a file with `POST /files/{task_id}/{name}` (max 8 MiB). |
-| `a2a_get_file` | `task_id`, `name`, `url?` | Downloads a staged file with `GET /files/{task_id}/{name}` (text inline, binary as base64). |
+| `a2a_gateways` | *(none)* | Lists configured named gateways (names, URLs, default agent, description, and `auth: configured\|none`; never exposes helper commands or credentials). |
+| `a2a_agents` | `gateway?`, `url?`, `agent?` | Fetches `GET /.well-known/agent.json` and the `GET /a2a` directory (or a single `GET /a2a/{agent}/.well-known/agent.json`) and lists names, versions, streaming support, and skills. |
+| `a2a_send` | `message`, `gateway?`, `agent?`, `url?`, `context_id?`, `stream?` | Starts a task with `message/send`, or `message/stream` (SSE) when `stream` is true. Returns `taskId`, `contextId`, `state`, and the agent's text. |
+| `a2a_status` | `task_id`, `gateway?`, `agent?`, `url?` | Calls `tasks/get` and returns the current state, artifacts, and latest agent message. |
+| `a2a_reply` | `task_id`, `message`, `gateway?`, `agent?`, `url?`, `context_id?`, `stream?` | Continues a task that is in `input-required` by sending another user message with the same `taskId`. |
+| `a2a_cancel` | `task_id`, `gateway?`, `agent?`, `url?` | Calls `tasks/cancel`. |
+| `a2a_card` | `gateway?`, `agent?`, `url?` | Fetches one agent's card from `/a2a/{agent}/.well-known/agent.json` (root card without `agent`). |
+| `a2a_get_task` | `task_id`, `gateway?`, `agent?`, `url?` | Calls `tasks/get` on `/a2a/{agent}`. |
+| `a2a_cancel_task` | `task_id`, `gateway?`, `agent?`, `url?` | Calls `tasks/cancel` on `/a2a/{agent}`. |
+| `a2a_send_file` | `task_id`, `name`, `content`, `encoding?`, `content_type?`, `gateway?`, `url?` | Stages a file with `POST /files/{task_id}/{name}` (max 8 MiB). |
+| `a2a_get_file` | `task_id`, `name`, `gateway?`, `url?` | Downloads a staged file with `GET /files/{task_id}/{name}` (text inline, binary as base64). |
 
 ### Multi-agent routing
 
 `agent` is an optional name matching `[a-z0-9][a-z0-9-]{0,62}` (for example `research`, `code-review`, `incident-triage`, `main`). It resolves to `<base>/a2a/<agent>` for JSON-RPC and `<base>/a2a/<agent>/.well-known/agent.json` for the card. Anything else (uppercase, `/`, `..`, `.`, encoded separators) is rejected before any request is made. The default comes from `PI_A2A_AGENT`.
 
-The slash command `/a2a [@agent] <message>` sends a message, and `/a2a card [@agent]` shows a card, when the host supports `registerCommand`.
+The slash command `/a2a [-g <gateway>] [@agent] <message>` sends a message, `/a2a card [-g <gateway>] [@agent]` (or `/a2a -g <gateway> card [@agent]`) shows a card, and `/a2a gateways` lists configured gateways, when the host supports `registerCommand`.
 
 ### Task file staging
 
@@ -109,6 +144,7 @@ The test suite spins up a loopback mock gateway with `node:http` and covers Agen
 Layout:
 
 - `src/client.mjs` — A2A JSON-RPC/SSE client (`discoverAgents`, `getAgentCard`, `sendMessage`, `getTask`, `cancelTask`, `sendFile`, `getFile`, `parseSseStream`)
+- `src/gateways.mjs` — named gateway config loader and fail-closed validator
 - `src/headers-helper.mjs` — helper command runner with strict header allowlist
 - `src/extension.mjs` — Pi tool registration (`registerPiA2aExtension`)
 - `src/extension.d.ts` — type declarations

@@ -299,6 +299,7 @@ export function runHeadersHelper(command, options = {}) {
  *   timeoutMs?: number;
  *   maxBufferBytes?: number;
  *   env?: NodeJS.ProcessEnv;
+ *   cwd?: string;
  * }} [options]
  * @returns {Promise<Record<string, string>>}
  */
@@ -311,6 +312,7 @@ export async function resolveHeaders(options = {}) {
       timeoutMs: options.timeoutMs,
       maxBufferBytes: options.maxBufferBytes,
       env: options.env,
+      cwd: options.cwd,
     });
     Object.assign(merged, helperHeaders);
   }
