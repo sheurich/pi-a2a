@@ -2154,6 +2154,11 @@ describe("A2A v1.0 protocol support", () => {
     assert.equal(replyRes.details.state, "completed");
     assert.match(replyRes.content[0].text, /continued:dev-usc1/);
 
+    // Named legacy v0.3 gateway routes with v0.3 directly
+    const legacyNamedRes = await pi.tools.get("a2a_send").execute("v1-leg-1", { gateway: "legacy", message: "hello-v03" });
+    assert.notEqual(legacyNamedRes.isError, true);
+    assert.match(legacyNamedRes.content[0].text, /echo: hello-v03/);
+
     // Legacy PI_A2A_URL honors PI_A2A_PROTOCOL and fails closed on invalid value
     const legacyBadPi = fakePi();
     registerPiA2aExtension(legacyBadPi, { env: { PI_A2A_URL: v1BaseUrl, PI_A2A_PROTOCOL: "9.9" } });
@@ -2282,7 +2287,151 @@ describe("A2A v1.0 protocol support", () => {
     );
     assert.equal(midStreamFetchCount, 1);
 
-    // 6. Exhausted timeout deadline rejects before starting a fallback request
+    // 6. Multi-frame stream: earlier progress statusUpdate does NOT suppress a terminal Task's history/messages answer,
+    //    and a later textless statusUpdate does NOT re-emit stale history text to onEvent
+    const multiFrameHistoryFetch = async () =>
+      new Response(
+        `data: ${JSON.stringify({
+          result: {
+            statusUpdate: {
+              taskId: "t-mf",
+              contextId: "c-mf",
+              status: { state: "TASK_STATE_WORKING", message: { role: "ROLE_AGENT", parts: [{ text: "Working" }] } },
+            },
+          },
+        })}\n\n` +
+          `data: ${JSON.stringify({
+            result: {
+              task: {
+                id: "t-mf",
+                contextId: "c-mf",
+                status: { state: "TASK_STATE_COMPLETED" },
+                history: [{ role: "ROLE_AGENT", parts: [{ text: "Final answer" }] }],
+              },
+            },
+          })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    const mfHist = await sendMessage({
+      baseUrl: "https://safe.example",
+      protocol: "1.0",
+      message: "hi",
+      stream: true,
+      fetchImpl: multiFrameHistoryFetch,
+    });
+    assert.equal(mfHist.state, "completed");
+    assert.equal(mfHist.text, "Final answer");
+
+    const multiFrameMessagesFetch = async () =>
+      new Response(
+        `data: ${JSON.stringify({
+          result: {
+            statusUpdate: {
+              taskId: "t-mf2",
+              contextId: "c-mf2",
+              status: { state: "TASK_STATE_WORKING", message: { role: "ROLE_AGENT", parts: [{ text: "Working" }] } },
+            },
+          },
+        })}\n\n` +
+          `data: ${JSON.stringify({
+            result: {
+              task: {
+                id: "t-mf2",
+                contextId: "c-mf2",
+                status: { state: "TASK_STATE_COMPLETED" },
+                messages: [{ role: "agent", parts: [{ type: "text", text: "Messages final" }] }],
+              },
+            },
+          })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    const mfMsg = await sendMessage({
+      baseUrl: "https://safe.example",
+      protocol: "1.0",
+      message: "hi",
+      stream: true,
+      fetchImpl: multiFrameMessagesFetch,
+    });
+    assert.equal(mfMsg.state, "completed");
+    assert.equal(mfMsg.text, "Messages final");
+
+    /** @type {Array<{ kind: string; text?: string }>} */
+    const staleCheckEvents = [];
+    const staleHistoryEventFetch = async () =>
+      new Response(
+        `data: ${JSON.stringify({
+          result: {
+            task: {
+              id: "t-sh",
+              contextId: "c-sh",
+              status: { state: "TASK_STATE_WORKING" },
+              history: [{ role: "ROLE_AGENT", parts: [{ text: "partial" }] }],
+            },
+          },
+        })}\n\n` +
+          `data: ${JSON.stringify({
+            result: {
+              statusUpdate: {
+                taskId: "t-sh",
+                contextId: "c-sh",
+                status: { state: "TASK_STATE_WORKING" },
+              },
+            },
+          })}\n\n`,
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    await sendMessage({
+      baseUrl: "https://safe.example",
+      protocol: "1.0",
+      message: "hi",
+      stream: true,
+      fetchImpl: staleHistoryEventFetch,
+      onEvent: (e) => staleCheckEvents.push({ kind: e.kind, text: e.text }),
+    });
+    assert.equal(staleCheckEvents.length, 2);
+    assert.equal(staleCheckEvents[0].text, "partial");
+    assert.equal(staleCheckEvents[1].text, "");
+
+    // 7. HTTP 405 on v0.3 Agent Card falls back to v1.0 in auto mode; strict protocol "1.0" never falls back to v0.3 on -32601
+    /** @type {string[]} */
+    const card405Urls = [];
+    const card405 = await getAgentCard({
+      baseUrl: "https://safe.example",
+      fetchImpl: async (url) => {
+        card405Urls.push(String(url));
+        if (card405Urls.length === 1) return new Response("method not allowed", { status: 405 });
+        return new Response(JSON.stringify({ name: "V1After405" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    assert.equal(card405.name, "V1After405");
+    assert.deepEqual(card405Urls, [
+      "https://safe.example/.well-known/agent.json",
+      "https://safe.example/.well-known/agent-card.json",
+    ]);
+
+    let strictV1Calls = 0;
+    await assert.rejects(
+      () =>
+        sendMessage({
+          baseUrl: "https://safe.example",
+          protocol: "1.0",
+          message: "hi",
+          fetchImpl: async () => {
+            strictV1Calls += 1;
+            return new Response(
+              JSON.stringify({ jsonrpc: "2.0", id: "1", error: { code: -32601, message: "Unknown method: SendMessage" } }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          },
+        }),
+      (err) => err instanceof A2AError && err.code === -32601,
+    );
+    assert.equal(strictV1Calls, 1);
+
+    // 8. Exhausted timeout deadline rejects before starting a fallback request (card & sendMessage; mocks intentionally ignore abort signal to return after deadline)
     let timeoutFetchCount = 0;
     const slow404Fetch = async () => {
       timeoutFetchCount += 1;
@@ -2294,5 +2443,20 @@ describe("A2A v1.0 protocol support", () => {
       (err) => err instanceof A2AError && /timed out/.test(err.message),
     );
     assert.equal(timeoutFetchCount, 1);
+
+    let sendTimeoutCount = 0;
+    const slowRpc404Fetch = async () => {
+      sendTimeoutCount += 1;
+      await new Promise((r) => setTimeout(r, 35));
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: "1", error: { code: -32601, message: "Method not found" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    await assert.rejects(
+      () => sendMessage({ baseUrl: "https://safe.example", message: "hi", timeoutMs: 20, fetchImpl: slowRpc404Fetch }),
+      (err) => err instanceof A2AError && /timed out/.test(err.message),
+    );
+    assert.equal(sendTimeoutCount, 1);
   });
 });

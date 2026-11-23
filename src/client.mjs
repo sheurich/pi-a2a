@@ -1403,17 +1403,27 @@ async function streamMessage(options, params, wireVersion) {
           typeof result.status?.state === "string" ? normalizeTaskState(result.status.state) : state;
         state = newState;
         const text = textFromParts(result.status?.message?.parts);
-        if (text) statusText = text;
+        let frameHistoryText = "";
         if (kind === "task") {
+          // A Task frame is a full snapshot; clear stale progress text from prior status updates.
+          statusText = text;
           if (Array.isArray(result.artifacts)) {
             for (const artifact of result.artifacts) {
               artifactText.set(artifact?.artifactId ?? newId(), textFromParts(artifact?.parts));
             }
           }
-          const latest = latestAgentHistoryText(result);
-          if (latest) historyText = latest;
+          frameHistoryText = latestAgentHistoryText(result);
+          if (frameHistoryText) historyText = frameHistoryText;
+        } else if (text) {
+          statusText = text;
         }
-        options.onEvent?.({ kind, state: newState, text: text || historyText, final: Boolean(result.final), raw: result });
+        options.onEvent?.({
+          kind,
+          state: newState,
+          text: text || frameHistoryText,
+          final: Boolean(result.final),
+          raw: result,
+        });
         if (result.final === true || (kind === "task" && TERMINAL_STATES.has(newState))) break;
       } else if (kind === "artifact-update") {
         const artifact = result.artifact ?? {};

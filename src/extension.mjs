@@ -21,6 +21,7 @@
  *                          `x-goog-iap-jwt-assertion` headers (JSON object or
  *                          `Header: value` lines on stdout)
  * - PI_A2A_AGENT           optional default agent name for legacy single-gateway mode
+ * - PI_A2A_PROTOCOL        optional wire protocol (`auto`, `0.3`, or `1.0`) for legacy mode
  *
  * Header values and helper commands are never accepted from tool parameters, so
  * the model cannot inject credentials or run arbitrary helper commands.
@@ -113,7 +114,7 @@ const taskIdProperty = { type: "string", description: "Task id returned by a2a_s
 const contextIdProperty = { type: "string", description: "Optional contextId to keep related tasks together." };
 const streamProperty = {
   type: "boolean",
-  description: "Use message/stream (Server-Sent Events) instead of message/send. Default false.",
+  description: "Use streaming (message/stream or SendStreamingMessage over SSE) instead of a blocking request. Default false.",
 };
 
 /**
@@ -148,7 +149,7 @@ export function formatResult(result, heading, gateway) {
 /**
  * Formats a single Agent Card summary for the model.
  *
- * @param {{ agent?: string; name: string; description?: string; version?: string; streaming: boolean; cardUrl: string; skills: Array<{ id?: string; name?: string; description?: string }> }} summary
+ * @param {{ agent?: string; name: string; description?: string; version?: string; protocolVersion?: string; streaming: boolean; cardUrl: string; skills: Array<{ id?: string; name?: string; description?: string }> }} summary
  * @param {string} [gateway]
  */
 export function formatCard(summary, gateway) {
@@ -191,8 +192,8 @@ export function formatAgents(discovery, gateway) {
  *
  * @param {{
  *   activeDefault: { kind: "named"; name: string } | { kind: "legacy" } | { kind: "none" };
- *   gateways: Array<{ name: string; url: string; agent?: string; description?: string; auth: "configured" | "none"; isDefault: boolean }>;
- *   legacy?: { url: string; agent?: string; auth: "configured" | "none"; isDefault: boolean };
+ *   gateways: Array<{ name: string; url: string; agent?: string; protocol?: "auto" | "0.3" | "1.0"; description?: string; auth: "configured" | "none"; isDefault: boolean }>;
+ *   legacy?: { url: string; agent?: string; protocol?: "auto" | "0.3" | "1.0"; auth: "configured" | "none"; isDefault: boolean };
  * }} summary
  */
 export function formatGateways(summary) {
