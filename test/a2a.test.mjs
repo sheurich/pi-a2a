@@ -9,9 +9,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   A2AError,
+  AGENT_CARD_PATH,
+  AGENT_CARD_V1_PATH,
   MAX_AGENT_CARD_BYTES,
   assertAllowedBaseUrl,
   buildAgentUrl,
+  buildMessageParams,
   cancelTask,
   discoverAgents,
   getTask,
@@ -20,7 +23,9 @@ import {
   sendFile,
   buildFileUrl,
   isReplyWithheld,
+  normalizeProtocol,
   normalizeResult,
+  normalizeTaskState,
   parseSseStream,
   sendMessage,
 } from "../src/client.mjs";
@@ -1579,5 +1584,533 @@ describe("named gateways", () => {
     const res = await pi.tools.get("a2a_send").execute("cwd-1", { message: "check-cwd" });
     assert.notEqual(res.isError, true);
     assert.equal(realpathSync(readFileSync(cwdLogPath, "utf8")), realpathSync(cfgDir));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A2A v1.0 protocol support (official spec, sumac-mcp, and Swival shapes)
+// ---------------------------------------------------------------------------
+
+describe("A2A v1.0 protocol support", () => {
+  /** @type {http.Server} */
+  let v1Server;
+  let v1BaseUrl = "";
+  /** @type {Array<{ method: string; path: string; rpcMethod?: string; body?: any }>} */
+  const v1Requests = [];
+  /** @type {Map<string, any>} */
+  const v1Tasks = new Map();
+  let v1Seq = 0;
+
+  before(async () => {
+    v1Server = http.createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const path = url.pathname;
+
+      if (req.method === "GET") {
+        v1Requests.push({ method: "GET", path });
+        if (path === "/.well-known/agent-card.json") {
+          return json(res, 200, {
+            name: "V1Gateway",
+            description: "Pure A2A v1.0 server",
+            version: "2.0.0",
+            capabilities: { streaming: true },
+            supportedInterfaces: [
+              { protocolBinding: "JSONRPC", protocolVersion: "1.0", url: `${v1BaseUrl}/` },
+            ],
+            skills: [{ id: "code", name: "Code", description: "Run code tasks" }],
+          });
+        }
+        if (path === "/a2a/swival/.well-known/agent-card.json") {
+          return json(res, 200, {
+            name: "swival (vertexai/gemini)",
+            version: "0.1.0",
+            url: `${v1BaseUrl}/a2a/swival`,
+            capabilities: { streaming: true },
+            supportedInterfaces: [
+              { protocolBinding: "JSONRPC", protocolVersion: "1.0", url: `${v1BaseUrl}/a2a/swival` },
+            ],
+            skills: [],
+          });
+        }
+        // Explicitly 404 on v0.3 card paths and /a2a directory
+        res.writeHead(404);
+        return res.end("not found");
+      }
+
+      if (req.method !== "POST") {
+        res.writeHead(405);
+        return res.end();
+      }
+
+      const raw = await readBody(req);
+      const body = JSON.parse(raw);
+      v1Requests.push({ method: "POST", path, rpcMethod: body.method, body });
+
+      if (req.headers.authorization === "Bearer unauthorized-check") {
+        res.writeHead(401, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "Unauthorized" } }));
+      }
+
+      // Reject v0.3 methods strictly with -32601
+      if (
+        body.method === "message/send" ||
+        body.method === "message/stream" ||
+        body.method === "tasks/get" ||
+        body.method === "tasks/cancel"
+      ) {
+        return rpcError(res, body.id, -32601, `Unknown method: ${body.method}`);
+      }
+
+      const isSwival = path === "/a2a/swival";
+
+      if (body.method === "SendMessage") {
+        const msg = body.params?.message;
+        const firstPart = msg?.parts?.[0];
+        const prompt = firstPart?.text ?? "";
+        if (prompt === "trigger-invalid-params") {
+          return rpcError(res, body.id, -32602, "Invalid params");
+        }
+        if (prompt === "trigger-withheld") {
+          return rpcError(res, body.id, -32000, "Policy blocked", { reason: "reply_withheld" });
+        }
+        if (prompt === "direct-message") {
+          return rpcResult(res, body.id, {
+            message: { role: "ROLE_AGENT", parts: [{ text: "direct-v1-reply" }], contextId: "ctx-direct" },
+          });
+        }
+        if (prompt === "need-more-info") {
+          const id = `v1-task-${++v1Seq}`;
+          const task = {
+            id,
+            contextId: msg.contextId ?? `v1-ctx-${v1Seq}`,
+            status: {
+              state: "TASK_STATE_INPUT_REQUIRED",
+              message: { role: "ROLE_AGENT", parts: [{ text: "Which environment?" }] },
+            },
+            artifacts: [],
+          };
+          v1Tasks.set(id, task);
+          return rpcResult(res, body.id, { task });
+        }
+        if (msg.taskId && v1Tasks.has(msg.taskId)) {
+          const task = v1Tasks.get(msg.taskId);
+          task.status = { state: "TASK_STATE_COMPLETED" };
+          task.artifacts = [{ artifactId: "reply", name: "answer", parts: [{ text: `continued:${prompt}` }] }];
+          return rpcResult(res, body.id, { task });
+        }
+        if (prompt === "start-working") {
+          const id = `v1-work-${++v1Seq}`;
+          const task = {
+            id,
+            contextId: "v1-ctx-work",
+            status: { state: "TASK_STATE_WORKING" },
+            artifacts: [],
+            history: [{ role: "ROLE_AGENT", parts: [{ text: "still crunching" }] }],
+          };
+          v1Tasks.set(id, task);
+          return rpcResult(res, body.id, task);
+        }
+        if (isSwival) {
+          // Swival puts the identical answer text in BOTH artifacts and status.message
+          const id = `swival-task-${++v1Seq}`;
+          const answer = `swival-answer:${prompt}`;
+          const task = {
+            id,
+            contextId: msg.contextId ?? `swival-ctx-${v1Seq}`,
+            status: {
+              state: "completed",
+              message: { role: "agent", parts: [{ type: "text", text: answer }] },
+            },
+            artifacts: [{ parts: [{ type: "text", text: answer }] }],
+          };
+          v1Tasks.set(id, task);
+          return rpcResult(res, body.id, task);
+        }
+
+        const id = `v1-done-${++v1Seq}`;
+        const task = {
+          id,
+          contextId: msg.contextId ?? `v1-ctx-${v1Seq}`,
+          status: { state: "TASK_STATE_COMPLETED" },
+          artifacts: [{ artifactId: "a1", parts: [{ text: `v1:${msg.role}:${prompt}` }] }],
+        };
+        v1Tasks.set(id, task);
+        return rpcResult(res, body.id, { task });
+      }
+
+      if (body.method === "SendStreamingMessage") {
+        const msg = body.params?.message;
+        const prompt = msg?.parts?.[0]?.text ?? "";
+        const id = `v1-stream-${++v1Seq}`;
+        const ctx = msg.contextId ?? `v1-sctx-${v1Seq}`;
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+
+        if (isSwival) {
+          // Swival emits bare SSE events (no JSON-RPC wrapper, no final flag)
+          sseWrite(
+            res,
+            { taskId: id, contextId: ctx, status: { state: "working" } },
+            { event: "TaskStatusUpdateEvent" },
+          );
+          sseWrite(
+            res,
+            { taskId: id, contextId: ctx, status: { state: "working" }, metadata: { type: "heartbeat", idle: 15.0 } },
+            { event: "TaskStatusUpdateEvent" },
+          );
+          sseWrite(
+            res,
+            { taskId: id, contextId: ctx, artifact: { parts: [{ type: "text", text: "draft" }] } },
+            { event: "TaskArtifactUpdateEvent" },
+          );
+          sseWrite(
+            res,
+            { taskId: id, contextId: ctx, artifact: { parts: [{ type: "text", text: `swival-stream:${prompt}` }] } },
+            { event: "TaskArtifactUpdateEvent" },
+          );
+          sseWrite(
+            res,
+            { taskId: id, contextId: ctx, status: { state: "completed" } },
+            { event: "TaskStatusUpdateEvent" },
+          );
+          return res.end();
+        }
+
+        // Official A2A v1.0 / sumac-mcp union-wrapped JSON-RPC SSE frames
+        sseWrite(res, {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            statusUpdate: {
+              taskId: id,
+              contextId: ctx,
+              status: { state: "TASK_STATE_WORKING" },
+              final: false,
+            },
+          },
+        });
+        sseWrite(res, {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            artifactUpdate: {
+              taskId: id,
+              contextId: ctx,
+              artifact: { artifactId: "reply", name: "answer", parts: [{ text: "hello " }] },
+              append: false,
+              lastChunk: false,
+            },
+          },
+        });
+        sseWrite(res, {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            artifactUpdate: {
+              taskId: id,
+              contextId: ctx,
+              artifact: { artifactId: "reply", name: "answer", parts: [{ text: prompt }] },
+              append: true,
+              lastChunk: true,
+            },
+          },
+        });
+        sseWrite(res, {
+          jsonrpc: "2.0",
+          id: body.id,
+          result: {
+            statusUpdate: {
+              taskId: id,
+              contextId: ctx,
+              status: { state: "TASK_STATE_COMPLETED" },
+              final: true,
+            },
+          },
+        });
+        return res.end();
+      }
+
+      if (body.method === "GetTask") {
+        const task = v1Tasks.get(body.params?.id);
+        if (!task) return rpcError(res, body.id, -32001, "Task not found");
+        return rpcResult(res, body.id, task);
+      }
+
+      if (body.method === "CancelTask") {
+        const task = v1Tasks.get(body.params?.id);
+        if (!task) return rpcError(res, body.id, -32001, "Task not found");
+        task.status = { state: "TASK_STATE_CANCELED" };
+        return rpcResult(res, body.id, task);
+      }
+
+      return rpcError(res, body.id, -32601, `Unknown method: ${body.method}`);
+    });
+
+    await new Promise((resolve) => v1Server.listen(0, "127.0.0.1", resolve));
+    const addr = /** @type {import("node:net").AddressInfo} */ (v1Server.address());
+    v1BaseUrl = `http://127.0.0.1:${addr.port}`;
+  });
+
+  after(async () => {
+    await new Promise((resolve) => v1Server.close(resolve));
+  });
+
+  it("normalizes v1.0 task states, union wrappers, ROLE_AGENT history, and Swival duplicate status text", () => {
+    assert.equal(normalizeTaskState("TASK_STATE_SUBMITTED"), "submitted");
+    assert.equal(normalizeTaskState("TASK_STATE_WORKING"), "working");
+    assert.equal(normalizeTaskState("TASK_STATE_INPUT_REQUIRED"), "input-required");
+    assert.equal(normalizeTaskState("TASK_STATE_COMPLETED"), "completed");
+    assert.equal(normalizeTaskState("TASK_STATE_CANCELED"), "canceled");
+    assert.equal(normalizeTaskState("TASK_STATE_FAILED"), "failed");
+    assert.equal(normalizeTaskState("TASK_STATE_REJECTED"), "rejected");
+    assert.equal(normalizeTaskState("TASK_STATE_AUTH_REQUIRED"), "auth-required");
+    assert.equal(normalizeTaskState("TASK_STATE_UNSPECIFIED"), "unknown");
+    assert.equal(normalizeTaskState("completed"), "completed");
+
+    assert.deepEqual(
+      buildMessageParams({ message: "hi", messageId: "m1", protocol: "1.0" }),
+      { message: { role: "ROLE_USER", messageId: "m1", parts: [{ text: "hi" }] } },
+    );
+    assert.deepEqual(
+      buildMessageParams({ message: "hi", messageId: "m2", protocol: "0.3" }),
+      { message: { kind: "message", role: "user", messageId: "m2", parts: [{ kind: "text", text: "hi" }] } },
+    );
+
+    const wrappedMsg = normalizeResult({
+      message: { role: "ROLE_AGENT", parts: [{ text: "hello" }], taskId: "t1", contextId: "c1" },
+    });
+    assert.equal(wrappedMsg.state, "completed");
+    assert.equal(wrappedMsg.text, "hello");
+    assert.equal(wrappedMsg.taskId, "t1");
+
+    const historyFallback = normalizeResult({
+      task: {
+        id: "t2",
+        contextId: "c2",
+        status: { state: "TASK_STATE_COMPLETED" },
+        history: [
+          { role: "ROLE_USER", parts: [{ text: "q" }] },
+          { role: "ROLE_AGENT", parts: [{ text: "a" }] },
+        ],
+      },
+    });
+    assert.equal(historyFallback.state, "completed");
+    assert.equal(historyFallback.text, "a");
+
+    // Identical artifact + status.message text is deduplicated (Swival format)
+    const dedup = normalizeResult({
+      id: "t3",
+      status: { state: "completed", message: { role: "agent", parts: [{ type: "text", text: "same" }] } },
+      artifacts: [{ parts: [{ type: "text", text: "same" }] }],
+    });
+    assert.equal(dedup.text, "same");
+
+    // Distinct artifact + status.message text are both preserved
+    const distinct = normalizeResult({
+      id: "t4",
+      status: { state: "completed", message: { role: "agent", parts: [{ text: "summary" }] } },
+      artifacts: [{ parts: [{ text: "artifact body" }] }],
+    });
+    assert.equal(distinct.text, "artifact body\nsummary");
+  });
+
+  it("speaks pure A2A v1.0 directly with protocol: '1.0' (zero v0.3 probes)", async () => {
+    v1Requests.length = 0;
+
+    const card = await getAgentCard({ baseUrl: v1BaseUrl, protocol: "1.0" });
+    assert.equal(card.name, "V1Gateway");
+    assert.equal(card.protocolVersion, "1.0");
+    assert.equal(card.url, `${v1BaseUrl}/`);
+    assert.equal(card.cardUrl, `${v1BaseUrl}${AGENT_CARD_V1_PATH}`);
+    assert.equal(v1Requests.length, 1);
+    assert.equal(v1Requests[0].path, AGENT_CARD_V1_PATH);
+
+    v1Requests.length = 0;
+    const sent = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "ping" });
+    assert.equal(sent.state, "completed");
+    assert.equal(sent.text, "v1:ROLE_USER:ping");
+    assert.equal(v1Requests.length, 1);
+    assert.equal(v1Requests[0].rpcMethod, "SendMessage");
+    assert.equal(v1Requests[0].body.params.message.kind, undefined);
+    assert.equal(v1Requests[0].body.params.message.role, "ROLE_USER");
+    assert.deepEqual(v1Requests[0].body.params.message.parts, [{ text: "ping" }]);
+
+    // Direct wrapped message result
+    const direct = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "direct-message" });
+    assert.equal(direct.state, "completed");
+    assert.equal(direct.text, "direct-v1-reply");
+
+    // Union-wrapped v1.0 SSE stream
+    v1Requests.length = 0;
+    /** @type {any[]} */
+    const seen = [];
+    const streamed = await sendMessage({
+      baseUrl: v1BaseUrl,
+      protocol: "1.0",
+      message: "v1-world",
+      stream: true,
+      onEvent: (e) => seen.push(e),
+    });
+    assert.equal(streamed.state, "completed");
+    assert.equal(streamed.text, "hello v1-world");
+    assert.equal(v1Requests.length, 1);
+    assert.equal(v1Requests[0].rpcMethod, "SendStreamingMessage");
+    assert.ok(seen.some((e) => e.kind === "status-update" && e.state === "working"));
+    assert.ok(seen.some((e) => e.kind === "status-update" && e.state === "completed" && e.final === true));
+
+    // GetTask + CancelTask
+    const working = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "start-working" });
+    assert.equal(working.state, "working");
+    assert.equal(working.text, "still crunching");
+
+    v1Requests.length = 0;
+    const fetched = await getTask({ baseUrl: v1BaseUrl, protocol: "1.0", taskId: working.taskId });
+    assert.equal(fetched.state, "working");
+    assert.equal(v1Requests.length, 1);
+    assert.equal(v1Requests[0].rpcMethod, "GetTask");
+
+    v1Requests.length = 0;
+    const canceled = await cancelTask({ baseUrl: v1BaseUrl, protocol: "1.0", taskId: working.taskId });
+    assert.equal(canceled.state, "canceled");
+    assert.equal(v1Requests.length, 1);
+    assert.equal(v1Requests[0].rpcMethod, "CancelTask");
+  });
+
+  it("handles Swival-style v1.0 responses, bare SSE events, and root-only discovery", async () => {
+    const discovery = await discoverAgents({ baseUrl: v1BaseUrl, protocol: "1.0" });
+    assert.equal(discovery.agents.length, 1);
+    assert.equal(discovery.agents[0].name, "V1Gateway");
+
+    const syncRes = await sendMessage({ baseUrl: v1BaseUrl, agent: "swival", protocol: "1.0", message: "check" });
+    assert.equal(syncRes.state, "completed");
+    assert.equal(syncRes.text, "swival-answer:check");
+
+    const streamRes = await sendMessage({
+      baseUrl: v1BaseUrl,
+      agent: "swival",
+      protocol: "1.0",
+      message: "build",
+      stream: true,
+    });
+    assert.equal(streamRes.state, "completed");
+    assert.equal(streamRes.text, "swival-stream:build");
+  });
+
+  it("auto-negotiates v1.0 on 404 / -32601 without retrying non-method errors, while protocol '0.3' stays strict", async () => {
+    // Auto falls back on 404 for Agent Card
+    v1Requests.length = 0;
+    const autoCard = await getAgentCard({ baseUrl: v1BaseUrl });
+    assert.equal(autoCard.name, "V1Gateway");
+    assert.deepEqual(
+      v1Requests.map((r) => r.path),
+      [AGENT_CARD_PATH, AGENT_CARD_V1_PATH],
+    );
+
+    // Auto falls back on -32601 for sendMessage, streaming, getTask, and cancelTask
+    v1Requests.length = 0;
+    const autoSent = await sendMessage({ baseUrl: v1BaseUrl, message: "auto-ping" });
+    assert.equal(autoSent.text, "v1:ROLE_USER:auto-ping");
+    assert.deepEqual(
+      v1Requests.map((r) => r.rpcMethod),
+      ["message/send", "SendMessage"],
+    );
+
+    v1Requests.length = 0;
+    const autoStream = await sendMessage({ baseUrl: v1BaseUrl, message: "auto-stream", stream: true });
+    assert.equal(autoStream.state, "completed");
+    assert.equal(autoStream.text, "hello auto-stream");
+    assert.deepEqual(
+      v1Requests.map((r) => r.rpcMethod),
+      ["message/stream", "SendStreamingMessage"],
+    );
+
+    // Auto does NOT retry non--32601 errors (e.g., 401 unauthorized or -32602 invalid params)
+    v1Requests.length = 0;
+    await assert.rejects(
+      () => sendMessage({ baseUrl: v1BaseUrl, headers: { authorization: "Bearer unauthorized-check" }, message: "x" }),
+      (err) => err instanceof A2AError && err.status === 401,
+    );
+    assert.equal(v1Requests.length, 1);
+
+    v1Requests.length = 0;
+    await assert.rejects(
+      () => sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "trigger-invalid-params" }),
+      (err) => err instanceof A2AError && err.code === -32602,
+    );
+    assert.equal(v1Requests.length, 1);
+
+    // reply_withheld works in v1.0 too
+    const withheld = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "trigger-withheld" });
+    assert.equal(withheld.state, "reply_withheld");
+
+    // Strict "0.3" never falls back to v1.0
+    v1Requests.length = 0;
+    await assert.rejects(
+      () => getAgentCard({ baseUrl: v1BaseUrl, protocol: "0.3" }),
+      (err) => err instanceof A2AError && err.status === 404,
+    );
+    assert.deepEqual(v1Requests.map((r) => r.path), [AGENT_CARD_PATH]);
+
+    v1Requests.length = 0;
+    await assert.rejects(
+      () => sendMessage({ baseUrl: v1BaseUrl, protocol: "0.3", message: "strict-v03" }),
+      (err) => err instanceof A2AError && err.code === -32601,
+    );
+    assert.deepEqual(v1Requests.map((r) => r.rpcMethod), ["message/send"]);
+  });
+
+  it("supports per-gateway protocol in a2a.json, isolates PI_A2A_PROTOCOL, and handles v1.0 input-required via Pi tools", async () => {
+    // Config validation rejects invalid protocol without echoing secret values
+    assert.throws(
+      () => validateGatewayConfig({ gateways: { bad: { url: v1BaseUrl, protocol: "SECRET_PROTO_VAL" } } }),
+      (err) => err instanceof A2AError && /Invalid protocol/.test(err.message) && !err.message.includes("SECRET_PROTO_VAL"),
+    );
+    assert.throws(() => normalizeProtocol("2.0"), /Invalid protocol/);
+
+    const pi = fakePi();
+    registerPiA2aExtension(pi, {
+      gateways: {
+        coder: { url: v1BaseUrl, protocol: "1.0", description: "Remote Coder v1.0" },
+        legacy: { url: baseUrl, protocol: "0.3", agent: "echo" },
+      },
+      // Named gateways must NOT inherit PI_A2A_PROTOCOL even if set to an invalid value
+      env: { PI_A2A_PROTOCOL: "invalid-should-be-ignored-for-named" },
+    });
+
+    const gwList = await pi.tools.get("a2a_gateways").execute("v1-gw-1", {});
+    assert.notEqual(gwList.isError, true);
+    assert.match(gwList.content[0].text, /coder:.*protocol: 1\.0/);
+    assert.match(gwList.content[0].text, /legacy:.*protocol: 0\.3/);
+
+    const cardRes = await pi.tools.get("a2a_card").execute("v1-card-1", { gateway: "coder" });
+    assert.notEqual(cardRes.isError, true);
+    assert.match(cardRes.content[0].text, /protocolVersion: 1\.0/);
+
+    // input-required -> a2a_reply over v1.0
+    const askRes = await pi.tools.get("a2a_send").execute("v1-ask-1", { gateway: "coder", message: "need-more-info" });
+    assert.notEqual(askRes.isError, true);
+    assert.equal(askRes.details.state, "input-required");
+    assert.match(askRes.content[0].text, /Continue with a2a_reply/);
+
+    const replyRes = await pi.tools.get("a2a_reply").execute("v1-rep-1", {
+      gateway: "coder",
+      task_id: askRes.details.taskId,
+      message: "dev-usc1",
+    });
+    assert.notEqual(replyRes.isError, true);
+    assert.equal(replyRes.details.state, "completed");
+    assert.match(replyRes.content[0].text, /continued:dev-usc1/);
+
+    // Legacy PI_A2A_URL honors PI_A2A_PROTOCOL and fails closed on invalid value
+    const legacyBadPi = fakePi();
+    registerPiA2aExtension(legacyBadPi, { env: { PI_A2A_URL: v1BaseUrl, PI_A2A_PROTOCOL: "9.9" } });
+    const badRes = await legacyBadPi.tools.get("a2a_card").execute("v1-bad-1", {});
+    assert.equal(badRes.isError, true);
+    assert.match(badRes.content[0].text, /Invalid PI_A2A_PROTOCOL/);
+
+    const legacyV1Pi = fakePi();
+    registerPiA2aExtension(legacyV1Pi, { env: { PI_A2A_URL: v1BaseUrl, PI_A2A_PROTOCOL: "1.0" } });
+    const okLegacy = await legacyV1Pi.tools.get("a2a_send").execute("v1-ok-1", { message: "via-env" });
+    assert.notEqual(okLegacy.isError, true);
+    assert.match(okLegacy.content[0].text, /v1:ROLE_USER:via-env/);
   });
 });

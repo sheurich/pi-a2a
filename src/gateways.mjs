@@ -19,7 +19,7 @@
 import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
-import { A2AError, AGENT_NAME_PATTERN, assertAllowedBaseUrl } from "./client.mjs";
+import { A2AError, AGENT_NAME_PATTERN, assertAllowedBaseUrl, normalizeProtocol } from "./client.mjs";
 import { splitCommandTokens } from "./headers-helper.mjs";
 
 export const ENV_CONFIG = "PI_A2A_CONFIG";
@@ -31,7 +31,7 @@ export const MAX_GATEWAYS = 64;
 export const MAX_DESCRIPTION_CHARS = 256;
 
 const ALLOWED_TOP_LEVEL_KEYS = Object.freeze(new Set(["defaultGateway", "gateways"]));
-const ALLOWED_GATEWAY_KEYS = Object.freeze(new Set(["url", "headersHelper", "agent", "description"]));
+const ALLOWED_GATEWAY_KEYS = Object.freeze(new Set(["url", "headersHelper", "agent", "description", "protocol"]));
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
 
 /**
@@ -40,6 +40,7 @@ const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
  *   headersHelper?: string | string[];
  *   agent?: string;
  *   description?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
  * }} GatewayInput
  */
 
@@ -51,6 +52,7 @@ const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
  *   headersHelper: string | readonly string[] | undefined;
  *   agent: string | undefined;
  *   description: string | undefined;
+ *   protocol: "auto" | "0.3" | "1.0" | undefined;
  * }>} ResolvedGateway
  */
 
@@ -185,7 +187,7 @@ function validateGatewayEntry(name, rawEntry, sourceLabel) {
   for (const key of Object.getOwnPropertyNames(rawEntry)) {
     if (!ALLOWED_GATEWAY_KEYS.has(key)) {
       throw new A2AError(
-        `Unknown key "${key}" in A2A gateway "${name}" (${sourceLabel}). Allowed keys: url, headersHelper, agent, description`,
+        `Unknown key "${key}" in A2A gateway "${name}" (${sourceLabel}). Allowed keys: url, headersHelper, agent, description, protocol`,
       );
     }
   }
@@ -228,6 +230,15 @@ function validateGatewayEntry(name, rawEntry, sourceLabel) {
     }
   }
 
+  /** @type {"auto" | "0.3" | "1.0" | undefined} */
+  let protocol;
+  if (rawEntry.protocol !== undefined) {
+    if (typeof rawEntry.protocol !== "string" || !rawEntry.protocol.trim()) {
+      throw new A2AError(`Invalid protocol for ${label}: must be one of auto, 0.3, 1.0`);
+    }
+    protocol = normalizeProtocol(rawEntry.protocol, `protocol for ${label}`);
+  }
+
   return Object.freeze({
     name,
     url,
@@ -235,6 +246,7 @@ function validateGatewayEntry(name, rawEntry, sourceLabel) {
     headersHelper,
     agent,
     description,
+    protocol,
   });
 }
 

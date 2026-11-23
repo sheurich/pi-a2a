@@ -15,6 +15,7 @@
  */
 
 export const AGENT_CARD_PATH = "/.well-known/agent.json";
+export const AGENT_CARD_V1_PATH = "/.well-known/agent-card.json";
 export const AGENT_DIRECTORY_PATH = "/a2a";
 export const MAX_AGENT_CARD_BYTES = 64 * 1024;
 export const MAX_RPC_BODY_BYTES = 4 * 1024 * 1024;
@@ -22,6 +23,38 @@ export const MAX_SSE_BYTES = 4 * 1024 * 1024;
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 export const FILES_PATH = "/files";
 export const DEFAULT_TIMEOUT_MS = 60_000;
+
+export const PROTOCOL_VERSIONS = Object.freeze(["auto", "0.3", "1.0"]);
+export const DEFAULT_PROTOCOL = "auto";
+
+const PROTOCOL_SET = Object.freeze(new Set(PROTOCOL_VERSIONS));
+
+const RPC_METHODS = Object.freeze({
+  "0.3": Object.freeze({
+    send: "message/send",
+    stream: "message/stream",
+    getTask: "tasks/get",
+    cancelTask: "tasks/cancel",
+  }),
+  "1.0": Object.freeze({
+    send: "SendMessage",
+    stream: "SendStreamingMessage",
+    getTask: "GetTask",
+    cancelTask: "CancelTask",
+  }),
+});
+
+const V1_TASK_STATES = Object.freeze({
+  TASK_STATE_SUBMITTED: "submitted",
+  TASK_STATE_WORKING: "working",
+  TASK_STATE_INPUT_REQUIRED: "input-required",
+  TASK_STATE_COMPLETED: "completed",
+  TASK_STATE_CANCELED: "canceled",
+  TASK_STATE_FAILED: "failed",
+  TASK_STATE_REJECTED: "rejected",
+  TASK_STATE_AUTH_REQUIRED: "auth-required",
+  TASK_STATE_UNSPECIFIED: "unknown",
+});
 
 export const REPLY_WITHHELD = "reply_withheld";
 
@@ -103,6 +136,67 @@ function normalizeAgent(agent) {
 export const AGENT_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
+
+/**
+ * Validates an optional A2A protocol version (`"auto"`, `"0.3"`, or `"1.0"`).
+ * Never echoes raw invalid values in error messages.
+ *
+ * @param {unknown} value
+ * @param {string} [label]
+ * @returns {"auto" | "0.3" | "1.0" | undefined}
+ */
+export function normalizeProtocol(value, label = "protocol") {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new A2AError(`Invalid ${label}: must be one of ${PROTOCOL_VERSIONS.join(", ")}`);
+  }
+  const trimmed = value.trim();
+  if (!PROTOCOL_SET.has(trimmed)) {
+    throw new A2AError(`Invalid ${label}: must be one of ${PROTOCOL_VERSIONS.join(", ")}`);
+  }
+  return /** @type {"auto" | "0.3" | "1.0"} */ (trimmed);
+}
+
+/**
+ * Normalizes A2A task state strings (both v0.3 lowercase and v1.0 `TASK_STATE_*` enums).
+ *
+ * @param {unknown} state
+ * @returns {string}
+ */
+export function normalizeTaskState(state) {
+  if (typeof state !== "string" || !state) return "unknown";
+  if (Object.hasOwn(V1_TASK_STATES, state)) {
+    return V1_TASK_STATES[/** @type {keyof typeof V1_TASK_STATES} */ (state)];
+  }
+  return state;
+}
+
+/**
+ * @param {unknown} role
+ */
+function isAgentRole(role) {
+  return role === "agent" || role === "ROLE_AGENT";
+}
+
+/**
+ * Returns true when an error is a JSON-RPC -32601 Method not found rejection.
+ *
+ * @param {unknown} err
+ */
+function isMethodNotFoundError(err) {
+  return err instanceof A2AError && err.code === -32601;
+}
+
+/**
+ * Computes remaining timeout budget in milliseconds from a deadline.
+ *
+ * @param {number} deadline
+ */
+function remainingTimeoutMs(deadline) {
+  return Math.max(1, deadline - Date.now());
+}
 
 /**
  * Validates a single URL path segment (task id or file name) so it cannot traverse
@@ -573,17 +667,65 @@ export function textFromParts(parts) {
 }
 
 /**
- * Normalizes a Task or Message result into `{ taskId, contextId, state, text, raw }`.
+ * Unwraps A2A v1.0 union envelopes (`{ task }`, `{ message }`, `{ statusUpdate }`,
+ * `{ artifactUpdate }`) or infers the kind of a bare v0.3 / Swival payload.
+ *
+ * @param {unknown} value
+ * @returns {{ kind: string | undefined; payload: Record<string, any> } | undefined}
+ */
+function unwrapA2aPayload(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const obj = /** @type {Record<string, any>} */ (value);
+
+  // v1.0 union wrappers (only when top-level is not already a bare Task/Message/Update)
+  if (!obj.kind && !obj.status && !obj.parts && !obj.artifact) {
+    if (obj.task && typeof obj.task === "object" && !Array.isArray(obj.task)) {
+      return { kind: "task", payload: obj.task };
+    }
+    if (obj.message && typeof obj.message === "object" && !Array.isArray(obj.message)) {
+      return { kind: "message", payload: obj.message };
+    }
+    if (obj.statusUpdate && typeof obj.statusUpdate === "object" && !Array.isArray(obj.statusUpdate)) {
+      return { kind: "status-update", payload: obj.statusUpdate };
+    }
+    if (obj.artifactUpdate && typeof obj.artifactUpdate === "object" && !Array.isArray(obj.artifactUpdate)) {
+      return { kind: "artifact-update", payload: obj.artifactUpdate };
+    }
+  }
+
+  if (typeof obj.kind === "string") {
+    return { kind: obj.kind, payload: obj };
+  }
+  if (obj.role && Array.isArray(obj.parts) && !obj.status) {
+    return { kind: "message", payload: obj };
+  }
+  if (obj.artifact && typeof obj.artifact === "object") {
+    return { kind: "artifact-update", payload: obj };
+  }
+  if (obj.status && typeof obj.status === "object") {
+    const looksLikeTask =
+      Array.isArray(obj.artifacts) ||
+      Array.isArray(obj.history) ||
+      Array.isArray(obj.messages) ||
+      (obj.id !== undefined && obj.taskId === undefined);
+    return { kind: looksLikeTask ? "task" : "status-update", payload: obj };
+  }
+  return { kind: undefined, payload: obj };
+}
+
+/**
+ * Normalizes a Task or Message result (v0.3 or v1.0) into `{ taskId, contextId, state, text, raw }`.
  *
  * @param {unknown} result
  * @returns {{ taskId: string | undefined; contextId: string | undefined; state: string; text: string; raw: unknown }}
  */
 export function normalizeResult(result) {
-  if (!result || typeof result !== "object") {
+  const unwrapped = unwrapA2aPayload(result);
+  if (!unwrapped) {
     return { taskId: undefined, contextId: undefined, state: "unknown", text: "", raw: result };
   }
-  const r = /** @type {any} */ (result);
-  if (r.kind === "message" || (r.role && Array.isArray(r.parts) && !r.status)) {
+  const { kind, payload: r } = unwrapped;
+  if (kind === "message") {
     return {
       taskId: r.taskId,
       contextId: r.contextId,
@@ -592,18 +734,24 @@ export function normalizeResult(result) {
       raw: result,
     };
   }
-  const state = typeof r.status?.state === "string" ? r.status.state : "unknown";
-  const chunks = [];
+  const state = normalizeTaskState(r.status?.state);
+  const artifactChunks = [];
   if (Array.isArray(r.artifacts)) {
-    for (const artifact of r.artifacts) chunks.push(textFromParts(artifact?.parts));
+    for (const artifact of r.artifacts) artifactChunks.push(textFromParts(artifact?.parts));
   }
+  const artifactJoined = artifactChunks.filter(Boolean).join("\n");
+  const chunks = artifactJoined ? [artifactJoined] : [];
   const statusText = textFromParts(r.status?.message?.parts);
-  if (statusText) chunks.push(statusText);
-  if (chunks.join("") === "" && Array.isArray(r.history)) {
-    for (let i = r.history.length - 1; i >= 0; i -= 1) {
-      const msg = r.history[i];
-      if (msg?.role === "agent") {
-        chunks.push(textFromParts(msg.parts));
+  if (statusText && statusText !== artifactJoined) {
+    chunks.push(statusText);
+  }
+  if (chunks.length === 0) {
+    const history = Array.isArray(r.history) ? r.history : Array.isArray(r.messages) ? r.messages : [];
+    for (let i = history.length - 1; i >= 0; i -= 1) {
+      const msg = history[i];
+      if (isAgentRole(msg?.role)) {
+        const text = textFromParts(msg.parts);
+        if (text) chunks.push(text);
         break;
       }
     }
@@ -618,7 +766,7 @@ export function normalizeResult(result) {
 }
 
 /**
- * Fetches and validates an Agent Card.
+ * Fetches and validates an Agent Card from an exact URL.
  *
  * @param {string} url
  * @param {{ headers?: Record<string, string>; signal?: AbortSignal; timeoutMs?: number; fetchImpl?: typeof fetch }} options
@@ -643,6 +791,47 @@ async function fetchAgentCard(url, options) {
     throw new A2AError(`Agent Card at ${redactUrl(url)} is not a JSON object`, { status });
   }
   return /** @type {Record<string, unknown>} */ (card);
+}
+
+/**
+ * Fetches an Agent Card respecting the configured protocol version:
+ * - `"0.3"`: `/.well-known/agent.json` only
+ * - `"1.0"`: `/.well-known/agent-card.json` only
+ * - `"auto"`: tries `/.well-known/agent.json`, falling back to `/.well-known/agent-card.json` on HTTP 404/405
+ *
+ * @param {string | URL} baseUrl
+ * @param {string | undefined} agent
+ * @param {"auto" | "0.3" | "1.0"} protocol
+ * @param {{ headers?: Record<string, string>; signal?: AbortSignal; timeoutMs?: number; fetchImpl?: typeof fetch }} options
+ * @returns {Promise<{ card: Record<string, unknown>; cardUrl: string }>}
+ */
+async function fetchAgentCardForProtocol(baseUrl, agent, protocol, options) {
+  if (protocol === "1.0") {
+    const cardUrl = buildAgentUrl(baseUrl, agent, AGENT_CARD_V1_PATH);
+    const card = await fetchAgentCard(cardUrl, options);
+    return { card, cardUrl };
+  }
+  const v03Url = buildAgentUrl(baseUrl, agent, AGENT_CARD_PATH);
+  if (protocol === "0.3") {
+    const card = await fetchAgentCard(v03Url, options);
+    return { card, cardUrl: v03Url };
+  }
+  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const card = await fetchAgentCard(v03Url, { ...options, timeoutMs: remainingTimeoutMs(deadline) });
+    return { card, cardUrl: v03Url };
+  } catch (err) {
+    if (
+      err instanceof A2AError &&
+      (err.status === 404 || err.status === 405) &&
+      !options.signal?.aborted
+    ) {
+      const v1Url = buildAgentUrl(baseUrl, agent, AGENT_CARD_V1_PATH);
+      const card = await fetchAgentCard(v1Url, { ...options, timeoutMs: remainingTimeoutMs(deadline) });
+      return { card, cardUrl: v1Url };
+    }
+    throw err;
+  }
 }
 
 /**
@@ -678,6 +867,26 @@ export function normalizeDirectory(directory) {
 }
 
 /**
+ * Extracts a JSON-RPC interface entry from an A2A v1.0 `supportedInterfaces` array.
+ *
+ * @param {Record<string, unknown>} card
+ * @returns {{ url?: string; protocolVersion?: string }}
+ */
+function extractSupportedInterface(card) {
+  if (!Array.isArray(card.supportedInterfaces)) return {};
+  const entries = card.supportedInterfaces.filter((item) => item && typeof item === "object");
+  const preferred =
+    entries.find((item) => String(/** @type {any} */ (item).protocolBinding ?? "").toUpperCase() === "JSONRPC") ??
+    entries[0];
+  if (!preferred) return {};
+  const p = /** @type {any} */ (preferred);
+  return {
+    url: typeof p.url === "string" ? p.url : undefined,
+    protocolVersion: typeof p.protocolVersion === "string" ? p.protocolVersion : undefined,
+  };
+}
+
+/**
  * Summarizes an Agent Card for display.
  *
  * @param {Record<string, unknown>} card
@@ -694,12 +903,17 @@ function summarizeCard(card, agent, cardUrl) {
         })
     : [];
   const capabilities = card.capabilities && typeof card.capabilities === "object" ? card.capabilities : {};
+  const iface = extractSupportedInterface(card);
+  const url = typeof card.url === "string" ? card.url : iface.url;
+  const protocolVersion =
+    typeof card.protocolVersion === "string" ? card.protocolVersion : iface.protocolVersion;
   return {
     agent,
     name: typeof card.name === "string" ? card.name : agent ?? "(unnamed)",
     description: typeof card.description === "string" ? card.description : undefined,
-    url: typeof card.url === "string" ? card.url : undefined,
+    url,
     version: typeof card.version === "string" ? card.version : undefined,
+    ...(protocolVersion ? { protocolVersion } : {}),
     streaming: Boolean(/** @type {any} */ (capabilities).streaming),
     skills,
     cardUrl,
@@ -710,13 +924,15 @@ function summarizeCard(card, agent, cardUrl) {
 /**
  * Discovers A2A agents.
  *
- * - With `agent`: fetches `GET /a2a/{agent}/.well-known/agent.json`.
- * - Without `agent`: fetches `GET /.well-known/agent.json` and the `GET /a2a` directory
+ * - With `agent`: fetches `/a2a/{agent}/.well-known/agent.json` (v0.3) or `agent-card.json` (v1.0).
+ * - Without `agent`: fetches the root Agent Card and the `GET /a2a` directory
  *   (each optional; at least one must succeed) and resolves each directory entry's card.
  *
  * @param {{
  *   baseUrl: string | URL;
  *   agent?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
+ *   pinnedOrigin?: string | URL;
  *   headers?: Record<string, string>;
  *   signal?: AbortSignal;
  *   timeoutMs?: number;
@@ -728,6 +944,7 @@ export async function discoverAgents(options) {
   assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
   const base = assertAllowedBaseUrl(options.baseUrl);
   const agent = normalizeAgent(options.agent);
+  const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
   const common = {
     headers: options.headers,
     signal: options.signal,
@@ -736,18 +953,16 @@ export async function discoverAgents(options) {
   };
 
   if (agent) {
-    const cardUrl = buildAgentUrl(base, agent, AGENT_CARD_PATH);
-    const card = await fetchAgentCard(cardUrl, common);
+    const { card, cardUrl } = await fetchAgentCardForProtocol(base, agent, protocol, common);
     return { baseUrl: base.toString(), agents: [summarizeCard(card, agent, cardUrl)], directory: [{ name: agent }], errors: [] };
   }
 
   /** @type {string[]} */
   const errors = [];
-  const rootCardUrl = buildAgentUrl(base, undefined, AGENT_CARD_PATH);
   const directoryUrl = buildAgentUrl(base, undefined, AGENT_DIRECTORY_PATH);
 
   const [rootCardResult, directoryResult] = await Promise.allSettled([
-    fetchAgentCard(rootCardUrl, common),
+    fetchAgentCardForProtocol(base, undefined, protocol, common),
     fetchCapped(directoryUrl, {
       headers: mergeHeaders(options.headers, { accept: "application/json" }),
       signal: options.signal,
@@ -760,7 +975,7 @@ export async function discoverAgents(options) {
   /** @type {Array<ReturnType<typeof summarizeCard>>} */
   const agents = [];
   if (rootCardResult.status === "fulfilled") {
-    agents.push(summarizeCard(rootCardResult.value, undefined, rootCardUrl));
+    agents.push(summarizeCard(rootCardResult.value.card, undefined, rootCardResult.value.cardUrl));
   } else {
     errors.push(`root card: ${rootCardResult.reason?.message ?? String(rootCardResult.reason)}`);
   }
@@ -782,7 +997,8 @@ export async function discoverAgents(options) {
     errors.push(`directory: ${directoryResult.reason?.message ?? String(directoryResult.reason)}`);
   }
 
-  /** @type {Array<{ entry: { name: string; description?: string; url?: string }; name: string; cardUrl: URL }>} */
+  const defaultCardPath = protocol === "1.0" ? AGENT_CARD_V1_PATH : AGENT_CARD_PATH;
+  /** @type {Array<{ entry: { name: string; description?: string; url?: string }; name: string; fallbackCardUrl: string }>} */
   const validDirectory = [];
   for (const entry of directory) {
     try {
@@ -791,16 +1007,16 @@ export async function discoverAgents(options) {
         errors.push("directory entry: agent name is required");
         continue;
       }
-      const cardUrl = buildAgentUrl(base, name, AGENT_CARD_PATH);
-      validDirectory.push({ entry, name, cardUrl });
+      const fallbackCardUrl = buildAgentUrl(base, name, defaultCardPath);
+      validDirectory.push({ entry, name, fallbackCardUrl });
     } catch (err) {
       errors.push(`${entry.name}: ${/** @type {Error} */ (err).message}`);
     }
   }
 
   const cardResults = await Promise.allSettled(
-    validDirectory.map(async ({ name, cardUrl }) => {
-      const card = await fetchAgentCard(cardUrl, common);
+    validDirectory.map(async ({ name }) => {
+      const { card, cardUrl } = await fetchAgentCardForProtocol(base, name, protocol, common);
       return summarizeCard(card, name, cardUrl);
     }),
   );
@@ -808,7 +1024,7 @@ export async function discoverAgents(options) {
     if (result.status === "fulfilled") {
       agents.push(result.value);
     } else {
-      const { entry, name, cardUrl } = validDirectory[index];
+      const { entry, name, fallbackCardUrl } = validDirectory[index];
       errors.push(`${name}: ${result.reason?.message ?? String(result.reason)}`);
       agents.push({
         agent: name,
@@ -818,7 +1034,7 @@ export async function discoverAgents(options) {
         version: undefined,
         streaming: false,
         skills: [],
-        cardUrl,
+        cardUrl: fallbackCardUrl,
         card: {},
       });
     }
@@ -831,12 +1047,13 @@ export async function discoverAgents(options) {
 }
 
 /**
- * Fetches a single Agent Card: `/a2a/{agent}/.well-known/agent.json`, or the root card
- * `/.well-known/agent.json` when `agent` is omitted.
+ * Fetches a single Agent Card: `/a2a/{agent}/.well-known/agent[-card].json`, or the root card
+ * when `agent` is omitted.
  *
  * @param {{
  *   baseUrl: string | URL;
  *   agent?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
  *   pinnedOrigin?: string | URL;
  *   headers?: Record<string, string>;
  *   signal?: AbortSignal;
@@ -847,27 +1064,42 @@ export async function discoverAgents(options) {
 export async function getAgentCard(options) {
   assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
   const agent = normalizeAgent(options.agent);
-  const cardUrl = buildAgentUrl(options.baseUrl, agent, AGENT_CARD_PATH);
-  const card = await fetchAgentCard(cardUrl, options);
+  const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
+  const { card, cardUrl } = await fetchAgentCardForProtocol(options.baseUrl, agent, protocol, options);
   return summarizeCard(card, agent, cardUrl);
 }
 
 /**
- * Builds the `message/send` / `message/stream` params object.
+ * Builds the `message/send` / `SendMessage` (or streaming) params object.
  *
- * @param {{ message: string; messageId?: string; taskId?: string; contextId?: string; metadata?: Record<string, unknown> }} input
+ * @param {{
+ *   message: string;
+ *   messageId?: string;
+ *   taskId?: string;
+ *   contextId?: string;
+ *   metadata?: Record<string, unknown>;
+ *   protocol?: "auto" | "0.3" | "1.0";
+ * }} input
  */
 export function buildMessageParams(input) {
   if (typeof input.message !== "string" || !input.message.trim()) {
     throw new A2AError("message must be a non-empty string");
   }
+  const protocol = normalizeProtocol(input.protocol) ?? "0.3";
   /** @type {Record<string, unknown>} */
-  const message = {
-    kind: "message",
-    role: "user",
-    messageId: input.messageId ?? newId(),
-    parts: [{ kind: "text", text: input.message }],
-  };
+  const message =
+    protocol === "1.0"
+      ? {
+          role: "ROLE_USER",
+          messageId: input.messageId ?? newId(),
+          parts: [{ text: input.message }],
+        }
+      : {
+          kind: "message",
+          role: "user",
+          messageId: input.messageId ?? newId(),
+          parts: [{ kind: "text", text: input.message }],
+        };
   if (input.taskId) message.taskId = String(input.taskId);
   if (input.contextId) message.contextId = String(input.contextId);
   if (input.metadata) message.metadata = input.metadata;
@@ -875,7 +1107,8 @@ export function buildMessageParams(input) {
 }
 
 /**
- * Sends a message with `message/send` (default) or `message/stream` (SSE).
+ * Sends a message with `message/send` / `SendMessage` (default) or `message/stream` /
+ * `SendStreamingMessage` (SSE).
  *
  * Returns `{ taskId, contextId, state, text, raw }`. When the agent withholds its reply
  * (HTTP 502 or JSON-RPC error with `data.reason === "reply_withheld"`), the returned
@@ -884,10 +1117,13 @@ export function buildMessageParams(input) {
  * @param {{
  *   baseUrl: string | URL;
  *   agent?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
+ *   pinnedOrigin?: string | URL;
  *   message: string;
  *   messageId?: string;
  *   taskId?: string;
  *   contextId?: string;
+ *   metadata?: Record<string, unknown>;
  *   stream?: boolean;
  *   headers?: Record<string, string>;
  *   signal?: AbortSignal;
@@ -899,22 +1135,48 @@ export function buildMessageParams(input) {
  */
 export async function sendMessage(options) {
   assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
-  const params = buildMessageParams(options);
-  if (options.stream) {
-    return streamMessage(options, params);
-  }
-  try {
+  const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
+  const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
+  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+
+  /**
+   * @param {"0.3" | "1.0"} wireVersion
+   */
+  const attempt = async (wireVersion) => {
+    const params = buildMessageParams({ ...options, protocol: wireVersion });
+    const timeoutMs = remainingTimeoutMs(deadline);
+    if (options.stream) {
+      return streamMessage({ ...options, timeoutMs }, params, wireVersion);
+    }
     const result = await rpcCall({
       baseUrl: options.baseUrl,
       agent: options.agent,
-      method: "message/send",
+      pinnedOrigin: options.pinnedOrigin,
+      method: RPC_METHODS[wireVersion].send,
       params,
       headers: options.headers,
       signal: options.signal,
-      timeoutMs: options.timeoutMs,
+      timeoutMs,
       fetchImpl: options.fetchImpl,
     });
     return normalizeResult(result);
+  };
+
+  try {
+    try {
+      return await attempt(initialVersion);
+    } catch (err) {
+      if (
+        protocol === "auto" &&
+        initialVersion === "0.3" &&
+        isMethodNotFoundError(err) &&
+        !(/** @type {any} */ (err).streamEventsEmitted) &&
+        !options.signal?.aborted
+      ) {
+        return await attempt("1.0");
+      }
+      throw err;
+    }
   } catch (err) {
     if (err instanceof A2AError && err.reason === REPLY_WITHHELD) {
       return {
@@ -933,11 +1195,13 @@ export async function sendMessage(options) {
 /**
  * @param {Parameters<typeof sendMessage>[0]} options
  * @param {ReturnType<typeof buildMessageParams>} params
+ * @param {"0.3" | "1.0"} wireVersion
  */
-async function streamMessage(options, params) {
+async function streamMessage(options, params, wireVersion) {
+  const method = RPC_METHODS[wireVersion].stream;
   const url = buildRpcUrl(options.baseUrl, options.agent);
   const id = newId();
-  const body = JSON.stringify({ jsonrpc: "2.0", id, method: "message/stream", params });
+  const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
   const headers = mergeHeaders(options.headers, {
     "content-type": "application/json",
     accept: "text/event-stream",
@@ -947,6 +1211,7 @@ async function streamMessage(options, params) {
 
   /** @type {unknown[]} */
   const events = [];
+  let emittedCount = 0;
   let taskId = options.taskId;
   let contextId = options.contextId;
   let state = "submitted";
@@ -957,8 +1222,11 @@ async function streamMessage(options, params) {
   let statusText = "";
 
   const collectText = () => {
-    const chunks = [...artifactText.values(), ...messageText];
-    if (statusText) chunks.push(statusText);
+    const artifactJoined = [...artifactText.values()].filter(Boolean).join("\n");
+    const chunks = [];
+    if (artifactJoined) chunks.push(artifactJoined);
+    chunks.push(...messageText.filter(Boolean));
+    if (statusText && statusText !== artifactJoined) chunks.push(statusText);
     return chunks.filter(Boolean).join("\n");
   };
 
@@ -994,7 +1262,7 @@ async function streamMessage(options, params) {
       try {
         parsed = parseJsonBody(text, response.status);
       } catch (err) {
-        throw new A2AError(`message/stream failed with HTTP ${response.status}: ${snippet(text) || "(no body)"}`, {
+        throw new A2AError(`${method} failed with HTTP ${response.status}: ${snippet(text) || "(no body)"}`, {
           status: response.status,
           cause: err,
         });
@@ -1006,14 +1274,14 @@ async function streamMessage(options, params) {
         throw err;
       }
       if (response.status >= 400) {
-        throw new A2AError(`message/stream failed with HTTP ${response.status}: ${snippet(text)}`, { status: response.status });
+        throw new A2AError(`${method} failed with HTTP ${response.status}: ${snippet(text)}`, { status: response.status });
       }
       const normalized = normalizeResult(envelope?.result);
       return { ...normalized, events: [envelope?.result] };
     }
 
     if (!response.body) {
-      throw new A2AError("message/stream response has no body", { status: response.status });
+      throw new A2AError(`${method} response has no body`, { status: response.status });
     }
 
     for await (const frame of parseSseStream(response.body, { maxBytes: MAX_SSE_BYTES })) {
@@ -1028,17 +1296,24 @@ async function streamMessage(options, params) {
       if (envelope?.error) {
         const err = rpcError(envelope.error, response.status);
         if (err.reason === REPLY_WITHHELD) return withheld(err.message, err.data ?? null);
+        if (emittedCount > 0) {
+          /** @type {any} */ (err).streamEventsEmitted = true;
+        }
         throw err;
       }
-      const result = envelope?.result ?? envelope;
-      if (!result || typeof result !== "object") continue;
-      const kind = result.kind ?? (result.status ? "status-update" : result.artifact ? "artifact-update" : undefined);
+      const rawResult = envelope?.result ?? envelope;
+      const unwrapped = unwrapA2aPayload(rawResult);
+      if (!unwrapped) continue;
+      const { kind, payload: result } = unwrapped;
+      if (!kind) continue;
 
+      emittedCount += 1;
       if (result.taskId ?? result.id) taskId = result.taskId ?? result.id;
       if (result.contextId) contextId = result.contextId;
 
       if (kind === "status-update" || kind === "task") {
-        const newState = typeof result.status?.state === "string" ? result.status.state : state;
+        const newState =
+          typeof result.status?.state === "string" ? normalizeTaskState(result.status.state) : state;
         state = newState;
         const text = textFromParts(result.status?.message?.parts);
         if (text) statusText = text;
@@ -1086,66 +1361,108 @@ function withBaseUrl(baseUrlOrOptions, maybeOptions) {
 }
 
 /**
- * Fetches a task with `tasks/get`. Callable as `getTask(options)` or `getTask(baseUrl, options)`.
+ * Fetches a task with `tasks/get` (v0.3) or `GetTask` (v1.0).
+ * Callable as `getTask(options)` or `getTask(baseUrl, options)`.
  *
  * @param {string | URL | {
  *   baseUrl: string | URL;
  *   agent?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
+ *   pinnedOrigin?: string | URL;
  *   taskId: string;
  *   historyLength?: number;
  *   headers?: Record<string, string>;
  *   signal?: AbortSignal;
  *   timeoutMs?: number;
  *   fetchImpl?: typeof fetch;
- * }} options
+ * }} baseUrlOrOptions
+ * @param {Record<string, any>} [maybeOptions]
  */
 export async function getTask(baseUrlOrOptions, maybeOptions) {
   const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
   assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
   if (!options.taskId) throw new A2AError("taskId is required");
+  const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
+  const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
+  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   /** @type {Record<string, unknown>} */
   const params = { id: String(options.taskId) };
   if (Number.isInteger(options.historyLength)) params.historyLength = options.historyLength;
-  const result = await rpcCall({
-    baseUrl: options.baseUrl,
-    agent: options.agent,
-    method: "tasks/get",
-    params,
-    headers: options.headers,
-    signal: options.signal,
-    timeoutMs: options.timeoutMs,
-    fetchImpl: options.fetchImpl,
-  });
+
+  const call = (/** @type {"0.3" | "1.0"} */ wireVersion) =>
+    rpcCall({
+      baseUrl: options.baseUrl,
+      agent: options.agent,
+      pinnedOrigin: options.pinnedOrigin,
+      method: RPC_METHODS[wireVersion].getTask,
+      params,
+      headers: options.headers,
+      signal: options.signal,
+      timeoutMs: remainingTimeoutMs(deadline),
+      fetchImpl: options.fetchImpl,
+    });
+
+  let result;
+  try {
+    result = await call(initialVersion);
+  } catch (err) {
+    if (protocol === "auto" && initialVersion === "0.3" && isMethodNotFoundError(err) && !options.signal?.aborted) {
+      result = await call("1.0");
+    } else {
+      throw err;
+    }
+  }
   return normalizeResult(result);
 }
 
 /**
- * Cancels a task with `tasks/cancel`.
+ * Cancels a task with `tasks/cancel` (v0.3) or `CancelTask` (v1.0).
  *
- * @param {{
+ * @param {string | URL | {
  *   baseUrl: string | URL;
  *   agent?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
+ *   pinnedOrigin?: string | URL;
  *   taskId: string;
  *   headers?: Record<string, string>;
  *   signal?: AbortSignal;
  *   timeoutMs?: number;
  *   fetchImpl?: typeof fetch;
- * }} options
+ * }} baseUrlOrOptions
+ * @param {Record<string, any>} [maybeOptions]
  */
 export async function cancelTask(baseUrlOrOptions, maybeOptions) {
   const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
   assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
   if (!options.taskId) throw new A2AError("taskId is required");
-  const result = await rpcCall({
-    baseUrl: options.baseUrl,
-    agent: options.agent,
-    method: "tasks/cancel",
-    params: { id: String(options.taskId) },
-    headers: options.headers,
-    signal: options.signal,
-    timeoutMs: options.timeoutMs,
-    fetchImpl: options.fetchImpl,
-  });
+  const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
+  const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
+  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const params = { id: String(options.taskId) };
+
+  const call = (/** @type {"0.3" | "1.0"} */ wireVersion) =>
+    rpcCall({
+      baseUrl: options.baseUrl,
+      agent: options.agent,
+      pinnedOrigin: options.pinnedOrigin,
+      method: RPC_METHODS[wireVersion].cancelTask,
+      params,
+      headers: options.headers,
+      signal: options.signal,
+      timeoutMs: remainingTimeoutMs(deadline),
+      fetchImpl: options.fetchImpl,
+    });
+
+  let result;
+  try {
+    result = await call(initialVersion);
+  } catch (err) {
+    if (protocol === "auto" && initialVersion === "0.3" && isMethodNotFoundError(err) && !options.signal?.aborted) {
+      result = await call("1.0");
+    } else {
+      throw err;
+    }
+  }
   return normalizeResult(result);
 }
 

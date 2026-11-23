@@ -28,7 +28,17 @@
 
 import { dirname } from "node:path";
 
-import { cancelTask, discoverAgents, getAgentCard, getFile, getTask, sendFile, sendMessage, A2AError } from "./client.mjs";
+import {
+  cancelTask,
+  discoverAgents,
+  getAgentCard,
+  getFile,
+  getTask,
+  normalizeProtocol,
+  sendFile,
+  sendMessage,
+  A2AError,
+} from "./client.mjs";
 import {
   ENV_CONFIG,
   ENV_GATEWAY,
@@ -44,6 +54,7 @@ import { resolveHeaders } from "./headers-helper.mjs";
 export const ENV_URL = "PI_A2A_URL";
 export const ENV_HEADERS_HELPER = "PI_A2A_HEADERS_HELPER";
 export const ENV_AGENT = "PI_A2A_AGENT";
+export const ENV_PROTOCOL = "PI_A2A_PROTOCOL";
 export { ENV_CONFIG, ENV_GATEWAY, GATEWAY_NAME_PATTERN, MAX_CONFIG_BYTES, loadGatewayConfig, validateGatewayConfig };
 
 /**
@@ -57,6 +68,7 @@ export { ENV_CONFIG, ENV_GATEWAY, GATEWAY_NAME_PATTERN, MAX_CONFIG_BYTES, loadGa
  *   baseUrl?: string;
  *   headersHelper?: string | string[];
  *   agent?: string;
+ *   protocol?: "auto" | "0.3" | "1.0";
  *   gateway?: string;
  *   gateways?: Record<string, GatewayInput>;
  *   env?: NodeJS.ProcessEnv;
@@ -75,6 +87,7 @@ export function readConfig(env = process.env) {
     baseUrl: trim(env[ENV_URL]),
     headersHelper: trim(env[ENV_HEADERS_HELPER]),
     agent: trim(env[ENV_AGENT]),
+    protocol: trim(env[ENV_PROTOCOL]),
     configPath: trim(env[ENV_CONFIG]),
     gateway: trim(env[ENV_GATEWAY]),
   };
@@ -141,6 +154,7 @@ export function formatResult(result, heading, gateway) {
 export function formatCard(summary, gateway) {
   const lines = [`A2A agent card: ${summary.agent ? `${summary.agent} — ` : ""}${summary.name}${summary.version ? ` v${summary.version}` : ""}`];
   if (gateway) lines.push(`gateway: ${gateway}`);
+  if (summary.protocolVersion) lines.push(`protocolVersion: ${summary.protocolVersion}`);
   lines.push(`streaming: ${summary.streaming}`);
   if (summary.description) lines.push(summary.description);
   for (const skill of summary.skills.slice(0, 50)) {
@@ -190,6 +204,7 @@ export function formatGateways(summary) {
     for (const gw of summary.gateways) {
       const meta = [];
       if (gw.agent) meta.push(`agent: ${gw.agent}`);
+      if (gw.protocol) meta.push(`protocol: ${gw.protocol}`);
       meta.push(`auth: ${gw.auth}`);
       const suffix = gw.description ? ` — ${gw.description}` : "";
       lines.push(`- ${gw.name}${gw.isDefault ? " (default)" : ""}: ${gw.url} (${meta.join(", ")})${suffix}`);
@@ -198,6 +213,7 @@ export function formatGateways(summary) {
   if (summary.legacy) {
     const meta = [];
     if (summary.legacy.agent) meta.push(`agent: ${summary.legacy.agent}`);
+    if (summary.legacy.protocol) meta.push(`protocol: ${summary.legacy.protocol}`);
     meta.push(`auth: ${summary.legacy.auth}`);
     lines.push(
       `Legacy single-gateway (${ENV_URL})${summary.legacy.isDefault ? " (default)" : ""}: ${summary.legacy.url} (${meta.join(", ")})`,
@@ -359,6 +375,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
       gateway: name,
       baseUrl: entry.url,
       agent,
+      protocol: entry.protocol,
       headers,
       pinnedOrigin: entry.origin,
       fetchImpl: options.fetchImpl,
@@ -371,10 +388,11 @@ export default function registerPiA2aExtension(pi, options = {}) {
    * @param {string} configuredUrl
    * @param {string | string[] | undefined} headersHelper
    * @param {string | undefined} defaultAgent
+   * @param {"auto" | "0.3" | "1.0" | undefined} protocol
    * @param {string | undefined} requestedUrl
    * @param {string | undefined} requestedAgent
    */
-  async function buildLegacyConnection(configuredUrl, headersHelper, defaultAgent, requestedUrl, requestedAgent) {
+  async function buildLegacyConnection(configuredUrl, headersHelper, defaultAgent, protocol, requestedUrl, requestedAgent) {
     const baseUrl = requestedUrl || configuredUrl;
     if (headersHelper && requestedUrl) {
       let configuredOrigin;
@@ -398,6 +416,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
       gateway: undefined,
       baseUrl,
       agent,
+      protocol,
       headers,
       pinnedOrigin,
       fetchImpl: options.fetchImpl,
@@ -440,7 +459,8 @@ export default function registerPiA2aExtension(pi, options = {}) {
     }
 
     if (optionsBaseUrl) {
-      return buildLegacyConnection(optionsBaseUrl, legacyHelper, legacyAgent, requestedUrl, requestedAgent);
+      const legacyProtocol = normalizeProtocol(options.protocol ?? config.protocol, ENV_PROTOCOL);
+      return buildLegacyConnection(optionsBaseUrl, legacyHelper, legacyAgent, legacyProtocol, requestedUrl, requestedAgent);
     }
 
     if (config.gateway) {
@@ -449,7 +469,8 @@ export default function registerPiA2aExtension(pi, options = {}) {
     }
 
     if (config.baseUrl) {
-      return buildLegacyConnection(config.baseUrl, legacyHelper, legacyAgent, requestedUrl, requestedAgent);
+      const legacyProtocol = normalizeProtocol(options.protocol ?? config.protocol, ENV_PROTOCOL);
+      return buildLegacyConnection(config.baseUrl, legacyHelper, legacyAgent, legacyProtocol, requestedUrl, requestedAgent);
     }
 
     const loaded = loadGatewayConfig(env, options);
@@ -463,10 +484,12 @@ export default function registerPiA2aExtension(pi, options = {}) {
           `Refusing to send ${ENV_HEADERS_HELPER} credentials to a tool-supplied url when ${ENV_URL} is not configured.`,
         );
       }
+      const legacyProtocol = normalizeProtocol(options.protocol ?? config.protocol, ENV_PROTOCOL);
       return {
         gateway: undefined,
         baseUrl: requestedUrl,
         agent: requestedAgent || legacyAgent,
+        protocol: legacyProtocol,
         headers: {},
         pinnedOrigin: undefined,
         fetchImpl: options.fetchImpl,
@@ -493,6 +516,9 @@ export default function registerPiA2aExtension(pi, options = {}) {
     const legacyUrl = optionsBaseUrl || config.baseUrl;
     const legacyHelper = options.headersHelper ?? config.headersHelper;
     const legacyAgent = options.agent || config.agent;
+    const legacyProtocol = legacyUrl
+      ? normalizeProtocol(options.protocol ?? config.protocol, ENV_PROTOCOL)
+      : undefined;
 
     /** @type {{ kind: "named"; name: string } | { kind: "legacy" } | { kind: "none" }} */
     let activeDefault = { kind: "none" };
@@ -516,6 +542,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
           name,
           url: entry.url,
           ...(entry.agent ? { agent: entry.agent } : {}),
+          ...(entry.protocol ? { protocol: entry.protocol } : {}),
           ...(entry.description ? { description: entry.description } : {}),
           auth: /** @type {"configured" | "none"} */ (entry.headersHelper ? "configured" : "none"),
           isDefault: activeDefault.kind === "named" && activeDefault.name === name,
@@ -526,6 +553,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
       ? {
           url: sanitizeDisplayUrl(legacyUrl),
           ...(legacyAgent ? { agent: legacyAgent } : {}),
+          ...(legacyProtocol ? { protocol: legacyProtocol } : {}),
           auth: /** @type {"configured" | "none"} */ (legacyHelper ? "configured" : "none"),
           isDefault: activeDefault.kind === "legacy",
         }
@@ -574,7 +602,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     name: "a2a_gateways",
     label: "A2A Gateways",
     description:
-      "List configured named A2A gateways (names, URLs, default agents, descriptions, and whether auth is configured). Does not expose credentials or helper commands.",
+      "List configured named A2A gateways (names, URLs, default agents, protocols, descriptions, and whether auth is configured). Does not expose credentials or helper commands.",
     parameters: {
       type: "object",
       properties: {},
@@ -592,7 +620,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     name: "a2a_card",
     label: "A2A Card",
     description:
-      "Fetch one A2A agent's Agent Card (/a2a/{agent}/.well-known/agent.json, or the root card when no agent is given).",
+      "Fetch one A2A agent's Agent Card (/.well-known/agent.json or /.well-known/agent-card.json, under /a2a/{agent} when an agent is given).",
     parameters: {
       type: "object",
       properties: { gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
@@ -612,7 +640,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
   pi.registerTool({
     name: "a2a_get_task",
     label: "A2A Get Task",
-    description: "Get the current state, text, and artifacts of an A2A task (tasks/get).",
+    description: "Get the current state, text, and artifacts of an A2A task (tasks/get or GetTask).",
     parameters: {
       type: "object",
       properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
@@ -633,7 +661,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
   pi.registerTool({
     name: "a2a_cancel_task",
     label: "A2A Cancel Task",
-    description: "Cancel a running A2A task (tasks/cancel).",
+    description: "Cancel a running A2A task (tasks/cancel or CancelTask).",
     parameters: {
       type: "object",
       properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
@@ -761,7 +789,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     name: "a2a_agents",
     label: "A2A Agents",
     description:
-      "Discover A2A agents: fetches Agent Cards from /.well-known/agent.json and the /a2a directory, or a single agent's card when `agent` is given.",
+      "Discover A2A agents: fetches Agent Cards from /.well-known/agent.json or /.well-known/agent-card.json and the /a2a directory, or a single agent's card when `agent` is given.",
     parameters: {
       type: "object",
       properties: { gateway: gatewayProperty, url: urlProperty, agent: agentProperty },
@@ -785,7 +813,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
     name: "a2a_send",
     label: "A2A Send",
     description:
-      "Send a message to an A2A agent (JSON-RPC message/send, or message/stream when stream=true). Returns the task id, state, and reply text. If state is input-required, continue with a2a_reply.",
+      "Send a message to an A2A agent (JSON-RPC message/send or SendMessage, or streaming when stream=true). Returns the task id, state, and reply text. If state is input-required, continue with a2a_reply.",
     parameters: {
       type: "object",
       properties: {
@@ -824,7 +852,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
   pi.registerTool({
     name: "a2a_status",
     label: "A2A Status",
-    description: "Get the current state, text, and artifacts of an A2A task (tasks/get).",
+    description: "Get the current state, text, and artifacts of an A2A task (tasks/get or GetTask).",
     parameters: {
       type: "object",
       properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },
@@ -887,7 +915,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
   pi.registerTool({
     name: "a2a_cancel",
     label: "A2A Cancel",
-    description: "Cancel a running A2A task (tasks/cancel).",
+    description: "Cancel a running A2A task (tasks/cancel or CancelTask).",
     parameters: {
       type: "object",
       properties: { task_id: taskIdProperty, gateway: gatewayProperty, agent: agentProperty, url: urlProperty },

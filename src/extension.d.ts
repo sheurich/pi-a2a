@@ -34,11 +34,14 @@ export interface PiLikeExtensionApi {
   ): void;
 }
 
+export type ProtocolVersion = "auto" | "0.3" | "1.0";
+
 export interface GatewayInput {
   url: string;
   headersHelper?: string | string[];
   agent?: string;
   description?: string;
+  protocol?: ProtocolVersion;
 }
 
 export interface ResolvedGateway {
@@ -48,6 +51,7 @@ export interface ResolvedGateway {
   readonly headersHelper: string | readonly string[] | undefined;
   readonly agent: string | undefined;
   readonly description: string | undefined;
+  readonly protocol: ProtocolVersion | undefined;
 }
 
 export interface LoadedGatewayConfig {
@@ -61,6 +65,7 @@ export interface GatewayInventoryEntry {
   name: string;
   url: string;
   agent?: string;
+  protocol?: ProtocolVersion;
   description?: string;
   auth: "configured" | "none";
   isDefault: boolean;
@@ -72,6 +77,7 @@ export interface GatewayInventorySummary {
   legacy?: {
     url: string;
     agent?: string;
+    protocol?: ProtocolVersion;
     auth: "configured" | "none";
     isDefault: boolean;
   };
@@ -84,6 +90,8 @@ export interface PiA2aOptions {
   headersHelper?: string | string[];
   /** Overrides PI_A2A_AGENT. */
   agent?: string;
+  /** Overrides PI_A2A_PROTOCOL for legacy/ad-hoc calls. */
+  protocol?: ProtocolVersion;
   /** Default named gateway to target when `gateway` is omitted. */
   gateway?: string;
   /** Programmatic named gateway registry (replaces config file loading). */
@@ -107,6 +115,7 @@ export interface NormalizedTaskResult {
 export const ENV_URL: "PI_A2A_URL";
 export const ENV_HEADERS_HELPER: "PI_A2A_HEADERS_HELPER";
 export const ENV_AGENT: "PI_A2A_AGENT";
+export const ENV_PROTOCOL: "PI_A2A_PROTOCOL";
 export const ENV_CONFIG: "PI_A2A_CONFIG";
 export const ENV_GATEWAY: "PI_A2A_GATEWAY";
 export const GATEWAY_NAME_PATTERN: RegExp;
@@ -116,6 +125,7 @@ export function readConfig(env?: NodeJS.ProcessEnv): {
   baseUrl: string | undefined;
   headersHelper: string | undefined;
   agent: string | undefined;
+  protocol: string | undefined;
   configPath: string | undefined;
   gateway: string | undefined;
 };
