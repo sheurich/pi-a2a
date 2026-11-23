@@ -180,22 +180,50 @@ function isAgentRole(role) {
   return role === "agent" || role === "ROLE_AGENT";
 }
 
+const REMOTE_METHOD_NOT_FOUND = Symbol("remoteMethodNotFound");
+
 /**
- * Returns true when an error is a JSON-RPC -32601 Method not found rejection.
+ * Returns true when an error is a remote JSON-RPC -32601 Method not found rejection
+ * (never an observer/callback exception or an error thrown after stream events were accepted).
  *
  * @param {unknown} err
  */
-function isMethodNotFoundError(err) {
-  return err instanceof A2AError && err.code === -32601;
+function isRetryableMethodNotFound(err) {
+  return err instanceof A2AError && err.code === -32601 && /** @type {any} */ (err)[REMOTE_METHOD_NOT_FOUND] === true;
 }
 
 /**
- * Computes remaining timeout budget in milliseconds from a deadline.
+ * Computes remaining timeout budget in milliseconds from a deadline, throwing a timeout
+ * error before starting another network request when the budget is exhausted.
  *
  * @param {number} deadline
+ * @param {number} timeoutMs
  */
-function remainingTimeoutMs(deadline) {
-  return Math.max(1, deadline - Date.now());
+function remainingTimeoutMs(deadline, timeoutMs) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new A2AError(`A2A request timed out after ${timeoutMs} ms`);
+  }
+  return remaining;
+}
+
+/**
+ * Snapshots and validates `baseUrl` and optional `pinnedOrigin` into immutable strings
+ * so caller mutations to `URL` objects or `options` during an async request cannot
+ * redirect a fallback attempt to another host.
+ *
+ * @param {string | URL | undefined} rawBaseUrl
+ * @param {string | URL | undefined} rawPinnedOrigin
+ * @returns {{ baseUrl: string; pinnedOrigin: string | undefined }}
+ */
+function snapshotTarget(rawBaseUrl, rawPinnedOrigin) {
+  assertPinnedOrigin(rawBaseUrl, rawPinnedOrigin);
+  const baseUrl = assertAllowedBaseUrl(rawBaseUrl).toString();
+  const pinnedOrigin =
+    rawPinnedOrigin === undefined || rawPinnedOrigin === null || rawPinnedOrigin === ""
+      ? undefined
+      : new URL(String(rawPinnedOrigin)).origin;
+  return { baseUrl, pinnedOrigin };
 }
 
 /**
@@ -484,17 +512,21 @@ export function isReplyWithheld(input) {
  * @param {{ code?: number; message?: string; data?: unknown }} error
  * @param {number} [status]
  */
-function rpcError(error, status) {
+function rpcError(error, status, { allowMethodFallback = true } = {}) {
   const reason =
     error.data && typeof error.data === "object" && typeof (/** @type {any} */ (error.data).reason) === "string"
       ? /** @type {any} */ (error.data).reason
       : undefined;
-  return new A2AError(`A2A JSON-RPC error ${error.code ?? "?"}: ${error.message ?? "unknown error"}`, {
+  const err = new A2AError(`A2A JSON-RPC error ${error.code ?? "?"}: ${error.message ?? "unknown error"}`, {
     code: error.code,
     data: error.data,
     status,
     reason,
   });
+  if (allowMethodFallback && error.code === -32601) {
+    /** @type {any} */ (err)[REMOTE_METHOD_NOT_FOUND] = true;
+  }
+  return err;
 }
 
 /**
@@ -714,6 +746,25 @@ function unwrapA2aPayload(value) {
 }
 
 /**
+ * Extracts text from the latest agent message in a Task's `history` or `messages` array.
+ *
+ * @param {Record<string, any>} task
+ * @returns {string}
+ */
+function latestAgentHistoryText(task) {
+  const history = Array.isArray(task.history) ? task.history : Array.isArray(task.messages) ? task.messages : [];
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const msg = history[i];
+    if (isAgentRole(msg?.role)) {
+      const text = textFromParts(msg.parts);
+      if (text) return text;
+      break;
+    }
+  }
+  return "";
+}
+
+/**
  * Normalizes a Task or Message result (v0.3 or v1.0) into `{ taskId, contextId, state, text, raw }`.
  *
  * @param {unknown} result
@@ -746,15 +797,8 @@ export function normalizeResult(result) {
     chunks.push(statusText);
   }
   if (chunks.length === 0) {
-    const history = Array.isArray(r.history) ? r.history : Array.isArray(r.messages) ? r.messages : [];
-    for (let i = history.length - 1; i >= 0; i -= 1) {
-      const msg = history[i];
-      if (isAgentRole(msg?.role)) {
-        const text = textFromParts(msg.parts);
-        if (text) chunks.push(text);
-        break;
-      }
-    }
+    const historyText = latestAgentHistoryText(r);
+    if (historyText) chunks.push(historyText);
   }
   return {
     taskId: r.id ?? r.taskId,
@@ -799,13 +843,14 @@ async function fetchAgentCard(url, options) {
  * - `"1.0"`: `/.well-known/agent-card.json` only
  * - `"auto"`: tries `/.well-known/agent.json`, falling back to `/.well-known/agent-card.json` on HTTP 404/405
  *
- * @param {string | URL} baseUrl
+ * @param {string} baseUrl  Validated immutable base URL string
  * @param {string | undefined} agent
  * @param {"auto" | "0.3" | "1.0"} protocol
- * @param {{ headers?: Record<string, string>; signal?: AbortSignal; timeoutMs?: number; fetchImpl?: typeof fetch }} options
+ * @param {{ pinnedOrigin?: string; headers?: Record<string, string>; signal?: AbortSignal; timeoutMs?: number; fetchImpl?: typeof fetch }} options
  * @returns {Promise<{ card: Record<string, unknown>; cardUrl: string }>}
  */
 async function fetchAgentCardForProtocol(baseUrl, agent, protocol, options) {
+  assertPinnedOrigin(baseUrl, options.pinnedOrigin);
   if (protocol === "1.0") {
     const cardUrl = buildAgentUrl(baseUrl, agent, AGENT_CARD_V1_PATH);
     const card = await fetchAgentCard(cardUrl, options);
@@ -816,9 +861,10 @@ async function fetchAgentCardForProtocol(baseUrl, agent, protocol, options) {
     const card = await fetchAgentCard(v03Url, options);
     return { card, cardUrl: v03Url };
   }
-  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const totalTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + totalTimeoutMs;
   try {
-    const card = await fetchAgentCard(v03Url, { ...options, timeoutMs: remainingTimeoutMs(deadline) });
+    const card = await fetchAgentCard(v03Url, { ...options, timeoutMs: remainingTimeoutMs(deadline, totalTimeoutMs) });
     return { card, cardUrl: v03Url };
   } catch (err) {
     if (
@@ -826,8 +872,9 @@ async function fetchAgentCardForProtocol(baseUrl, agent, protocol, options) {
       (err.status === 404 || err.status === 405) &&
       !options.signal?.aborted
     ) {
+      assertPinnedOrigin(baseUrl, options.pinnedOrigin);
       const v1Url = buildAgentUrl(baseUrl, agent, AGENT_CARD_V1_PATH);
-      const card = await fetchAgentCard(v1Url, { ...options, timeoutMs: remainingTimeoutMs(deadline) });
+      const card = await fetchAgentCard(v1Url, { ...options, timeoutMs: remainingTimeoutMs(deadline, totalTimeoutMs) });
       return { card, cardUrl: v1Url };
     }
     throw err;
@@ -941,11 +988,11 @@ function summarizeCard(card, agent, cardUrl) {
  * @returns {Promise<{ baseUrl: string; agents: Array<ReturnType<typeof summarizeCard>>; directory: Array<{ name: string }>; errors: string[] }>}
  */
 export async function discoverAgents(options) {
-  assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
-  const base = assertAllowedBaseUrl(options.baseUrl);
+  const { baseUrl, pinnedOrigin } = snapshotTarget(options?.baseUrl, options?.pinnedOrigin);
   const agent = normalizeAgent(options.agent);
   const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
   const common = {
+    pinnedOrigin,
     headers: options.headers,
     signal: options.signal,
     timeoutMs: options.timeoutMs,
@@ -953,16 +1000,16 @@ export async function discoverAgents(options) {
   };
 
   if (agent) {
-    const { card, cardUrl } = await fetchAgentCardForProtocol(base, agent, protocol, common);
-    return { baseUrl: base.toString(), agents: [summarizeCard(card, agent, cardUrl)], directory: [{ name: agent }], errors: [] };
+    const { card, cardUrl } = await fetchAgentCardForProtocol(baseUrl, agent, protocol, common);
+    return { baseUrl, agents: [summarizeCard(card, agent, cardUrl)], directory: [{ name: agent }], errors: [] };
   }
 
   /** @type {string[]} */
   const errors = [];
-  const directoryUrl = buildAgentUrl(base, undefined, AGENT_DIRECTORY_PATH);
+  const directoryUrl = buildAgentUrl(baseUrl, undefined, AGENT_DIRECTORY_PATH);
 
   const [rootCardResult, directoryResult] = await Promise.allSettled([
-    fetchAgentCardForProtocol(base, undefined, protocol, common),
+    fetchAgentCardForProtocol(baseUrl, undefined, protocol, common),
     fetchCapped(directoryUrl, {
       headers: mergeHeaders(options.headers, { accept: "application/json" }),
       signal: options.signal,
@@ -1007,7 +1054,7 @@ export async function discoverAgents(options) {
         errors.push("directory entry: agent name is required");
         continue;
       }
-      const fallbackCardUrl = buildAgentUrl(base, name, defaultCardPath);
+      const fallbackCardUrl = buildAgentUrl(baseUrl, name, defaultCardPath);
       validDirectory.push({ entry, name, fallbackCardUrl });
     } catch (err) {
       errors.push(`${entry.name}: ${/** @type {Error} */ (err).message}`);
@@ -1016,7 +1063,7 @@ export async function discoverAgents(options) {
 
   const cardResults = await Promise.allSettled(
     validDirectory.map(async ({ name }) => {
-      const { card, cardUrl } = await fetchAgentCardForProtocol(base, name, protocol, common);
+      const { card, cardUrl } = await fetchAgentCardForProtocol(baseUrl, name, protocol, common);
       return summarizeCard(card, name, cardUrl);
     }),
   );
@@ -1041,9 +1088,9 @@ export async function discoverAgents(options) {
   });
 
   if (agents.length === 0) {
-    throw new A2AError(`No A2A agents discovered at ${redactUrl(base.toString())}: ${errors.join("; ")}`);
+    throw new A2AError(`No A2A agents discovered at ${redactUrl(baseUrl)}: ${errors.join("; ")}`);
   }
-  return { baseUrl: base.toString(), agents, directory, errors };
+  return { baseUrl, agents, directory, errors };
 }
 
 /**
@@ -1062,10 +1109,16 @@ export async function discoverAgents(options) {
  * }} options
  */
 export async function getAgentCard(options) {
-  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
+  const { baseUrl, pinnedOrigin } = snapshotTarget(options?.baseUrl, options?.pinnedOrigin);
   const agent = normalizeAgent(options.agent);
   const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
-  const { card, cardUrl } = await fetchAgentCardForProtocol(options.baseUrl, agent, protocol, options);
+  const { card, cardUrl } = await fetchAgentCardForProtocol(baseUrl, agent, protocol, {
+    pinnedOrigin,
+    headers: options.headers,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    fetchImpl: options.fetchImpl,
+  });
   return summarizeCard(card, agent, cardUrl);
 }
 
@@ -1134,30 +1187,59 @@ export function buildMessageParams(input) {
  * @returns {Promise<{ taskId: string | undefined; contextId: string | undefined; state: string; text: string; raw: unknown; error?: string; events?: unknown[] }>}
  */
 export async function sendMessage(options) {
-  assertPinnedOrigin(options?.baseUrl, options?.pinnedOrigin);
+  const { baseUrl, pinnedOrigin } = snapshotTarget(options?.baseUrl, options?.pinnedOrigin);
+  const agent = normalizeAgent(options.agent);
   const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
   const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
-  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const totalTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + totalTimeoutMs;
+  const messageSnapshot = {
+    message: options.message,
+    messageId: options.messageId,
+    taskId: options.taskId,
+    contextId: options.contextId,
+    metadata: options.metadata,
+  };
+  const headersSnapshot = options.headers ? { ...options.headers } : undefined;
+  const stream = Boolean(options.stream);
+  const signal = options.signal;
+  const onEvent = options.onEvent;
+  const fetchImpl = options.fetchImpl;
 
   /**
    * @param {"0.3" | "1.0"} wireVersion
    */
   const attempt = async (wireVersion) => {
-    const params = buildMessageParams({ ...options, protocol: wireVersion });
-    const timeoutMs = remainingTimeoutMs(deadline);
-    if (options.stream) {
-      return streamMessage({ ...options, timeoutMs }, params, wireVersion);
+    const params = buildMessageParams({ ...messageSnapshot, protocol: wireVersion });
+    const timeoutMs = remainingTimeoutMs(deadline, totalTimeoutMs);
+    if (stream) {
+      return streamMessage(
+        {
+          baseUrl,
+          agent,
+          pinnedOrigin,
+          taskId: messageSnapshot.taskId,
+          contextId: messageSnapshot.contextId,
+          headers: headersSnapshot,
+          signal,
+          timeoutMs,
+          onEvent,
+          fetchImpl,
+        },
+        params,
+        wireVersion,
+      );
     }
     const result = await rpcCall({
-      baseUrl: options.baseUrl,
-      agent: options.agent,
-      pinnedOrigin: options.pinnedOrigin,
+      baseUrl,
+      agent,
+      pinnedOrigin,
       method: RPC_METHODS[wireVersion].send,
       params,
-      headers: options.headers,
-      signal: options.signal,
+      headers: headersSnapshot,
+      signal,
       timeoutMs,
-      fetchImpl: options.fetchImpl,
+      fetchImpl,
     });
     return normalizeResult(result);
   };
@@ -1166,13 +1248,7 @@ export async function sendMessage(options) {
     try {
       return await attempt(initialVersion);
     } catch (err) {
-      if (
-        protocol === "auto" &&
-        initialVersion === "0.3" &&
-        isMethodNotFoundError(err) &&
-        !(/** @type {any} */ (err).streamEventsEmitted) &&
-        !options.signal?.aborted
-      ) {
+      if (protocol === "auto" && initialVersion === "0.3" && isRetryableMethodNotFound(err) && !signal?.aborted) {
         return await attempt("1.0");
       }
       throw err;
@@ -1180,8 +1256,8 @@ export async function sendMessage(options) {
   } catch (err) {
     if (err instanceof A2AError && err.reason === REPLY_WITHHELD) {
       return {
-        taskId: options.taskId,
-        contextId: options.contextId,
+        taskId: messageSnapshot.taskId,
+        contextId: messageSnapshot.contextId,
         state: REPLY_WITHHELD,
         text: "",
         raw: err.data ?? null,
@@ -1193,11 +1269,23 @@ export async function sendMessage(options) {
 }
 
 /**
- * @param {Parameters<typeof sendMessage>[0]} options
+ * @param {{
+ *   baseUrl: string;
+ *   agent?: string;
+ *   pinnedOrigin?: string;
+ *   taskId?: string;
+ *   contextId?: string;
+ *   headers?: Record<string, string>;
+ *   signal?: AbortSignal;
+ *   timeoutMs?: number;
+ *   onEvent?: (event: { kind: string; state?: string; text?: string; final?: boolean; raw: unknown }) => void;
+ *   fetchImpl?: typeof fetch;
+ * }} options
  * @param {ReturnType<typeof buildMessageParams>} params
  * @param {"0.3" | "1.0"} wireVersion
  */
 async function streamMessage(options, params, wireVersion) {
+  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
   const method = RPC_METHODS[wireVersion].stream;
   const url = buildRpcUrl(options.baseUrl, options.agent);
   const id = newId();
@@ -1220,6 +1308,7 @@ async function streamMessage(options, params, wireVersion) {
   /** @type {string[]} */
   const messageText = [];
   let statusText = "";
+  let historyText = "";
 
   const collectText = () => {
     const artifactJoined = [...artifactText.values()].filter(Boolean).join("\n");
@@ -1227,6 +1316,7 @@ async function streamMessage(options, params, wireVersion) {
     if (artifactJoined) chunks.push(artifactJoined);
     chunks.push(...messageText.filter(Boolean));
     if (statusText && statusText !== artifactJoined) chunks.push(statusText);
+    if (chunks.length === 0 && historyText) chunks.push(historyText);
     return chunks.filter(Boolean).join("\n");
   };
 
@@ -1269,7 +1359,7 @@ async function streamMessage(options, params, wireVersion) {
       }
       const envelope = /** @type {any} */ (parsed);
       if (envelope?.error) {
-        const err = rpcError(envelope.error, response.status);
+        const err = rpcError(envelope.error, response.status, { allowMethodFallback: true });
         if (err.reason === REPLY_WITHHELD) return withheld(err.message, err.data ?? null);
         throw err;
       }
@@ -1294,11 +1384,8 @@ async function streamMessage(options, params, wireVersion) {
       }
       events.push(envelope);
       if (envelope?.error) {
-        const err = rpcError(envelope.error, response.status);
+        const err = rpcError(envelope.error, response.status, { allowMethodFallback: emittedCount === 0 });
         if (err.reason === REPLY_WITHHELD) return withheld(err.message, err.data ?? null);
-        if (emittedCount > 0) {
-          /** @type {any} */ (err).streamEventsEmitted = true;
-        }
         throw err;
       }
       const rawResult = envelope?.result ?? envelope;
@@ -1317,12 +1404,16 @@ async function streamMessage(options, params, wireVersion) {
         state = newState;
         const text = textFromParts(result.status?.message?.parts);
         if (text) statusText = text;
-        if (kind === "task" && Array.isArray(result.artifacts)) {
-          for (const artifact of result.artifacts) {
-            artifactText.set(artifact?.artifactId ?? newId(), textFromParts(artifact?.parts));
+        if (kind === "task") {
+          if (Array.isArray(result.artifacts)) {
+            for (const artifact of result.artifacts) {
+              artifactText.set(artifact?.artifactId ?? newId(), textFromParts(artifact?.parts));
+            }
           }
+          const latest = latestAgentHistoryText(result);
+          if (latest) historyText = latest;
         }
-        options.onEvent?.({ kind, state: newState, text, final: Boolean(result.final), raw: result });
+        options.onEvent?.({ kind, state: newState, text: text || historyText, final: Boolean(result.final), raw: result });
         if (result.final === true || (kind === "task" && TERMINAL_STATES.has(newState))) break;
       } else if (kind === "artifact-update") {
         const artifact = result.artifact ?? {};
@@ -1380,33 +1471,38 @@ function withBaseUrl(baseUrlOrOptions, maybeOptions) {
  */
 export async function getTask(baseUrlOrOptions, maybeOptions) {
   const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
-  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
+  const { baseUrl, pinnedOrigin } = snapshotTarget(options.baseUrl, options.pinnedOrigin);
   if (!options.taskId) throw new A2AError("taskId is required");
+  const agent = normalizeAgent(options.agent);
   const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
   const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
-  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const totalTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + totalTimeoutMs;
+  const headersSnapshot = options.headers ? { ...options.headers } : undefined;
+  const signal = options.signal;
+  const fetchImpl = options.fetchImpl;
   /** @type {Record<string, unknown>} */
   const params = { id: String(options.taskId) };
   if (Number.isInteger(options.historyLength)) params.historyLength = options.historyLength;
 
   const call = (/** @type {"0.3" | "1.0"} */ wireVersion) =>
     rpcCall({
-      baseUrl: options.baseUrl,
-      agent: options.agent,
-      pinnedOrigin: options.pinnedOrigin,
+      baseUrl,
+      agent,
+      pinnedOrigin,
       method: RPC_METHODS[wireVersion].getTask,
       params,
-      headers: options.headers,
-      signal: options.signal,
-      timeoutMs: remainingTimeoutMs(deadline),
-      fetchImpl: options.fetchImpl,
+      headers: headersSnapshot,
+      signal,
+      timeoutMs: remainingTimeoutMs(deadline, totalTimeoutMs),
+      fetchImpl,
     });
 
   let result;
   try {
     result = await call(initialVersion);
   } catch (err) {
-    if (protocol === "auto" && initialVersion === "0.3" && isMethodNotFoundError(err) && !options.signal?.aborted) {
+    if (protocol === "auto" && initialVersion === "0.3" && isRetryableMethodNotFound(err) && !signal?.aborted) {
       result = await call("1.0");
     } else {
       throw err;
@@ -1433,31 +1529,36 @@ export async function getTask(baseUrlOrOptions, maybeOptions) {
  */
 export async function cancelTask(baseUrlOrOptions, maybeOptions) {
   const options = withBaseUrl(baseUrlOrOptions, maybeOptions);
-  assertPinnedOrigin(options.baseUrl, options.pinnedOrigin);
+  const { baseUrl, pinnedOrigin } = snapshotTarget(options.baseUrl, options.pinnedOrigin);
   if (!options.taskId) throw new A2AError("taskId is required");
+  const agent = normalizeAgent(options.agent);
   const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
   const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
-  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const totalTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const deadline = Date.now() + totalTimeoutMs;
+  const headersSnapshot = options.headers ? { ...options.headers } : undefined;
+  const signal = options.signal;
+  const fetchImpl = options.fetchImpl;
   const params = { id: String(options.taskId) };
 
   const call = (/** @type {"0.3" | "1.0"} */ wireVersion) =>
     rpcCall({
-      baseUrl: options.baseUrl,
-      agent: options.agent,
-      pinnedOrigin: options.pinnedOrigin,
+      baseUrl,
+      agent,
+      pinnedOrigin,
       method: RPC_METHODS[wireVersion].cancelTask,
       params,
-      headers: options.headers,
-      signal: options.signal,
-      timeoutMs: remainingTimeoutMs(deadline),
-      fetchImpl: options.fetchImpl,
+      headers: headersSnapshot,
+      signal,
+      timeoutMs: remainingTimeoutMs(deadline, totalTimeoutMs),
+      fetchImpl,
     });
 
   let result;
   try {
     result = await call(initialVersion);
   } catch (err) {
-    if (protocol === "auto" && initialVersion === "0.3" && isMethodNotFoundError(err) && !options.signal?.aborted) {
+    if (protocol === "auto" && initialVersion === "0.3" && isRetryableMethodNotFound(err) && !signal?.aborted) {
       result = await call("1.0");
     } else {
       throw err;

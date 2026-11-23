@@ -1651,6 +1651,10 @@ describe("A2A v1.0 protocol support", () => {
         return res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "Unauthorized" } }));
       }
 
+      if (body.params?.message?.parts?.[0]?.text === "trigger-invalid-params-auto") {
+        return rpcError(res, body.id, -32602, "Invalid params");
+      }
+
       // Reject v0.3 methods strictly with -32601
       if (
         body.method === "message/send" ||
@@ -1744,6 +1748,37 @@ describe("A2A v1.0 protocol support", () => {
         const id = `v1-stream-${++v1Seq}`;
         const ctx = msg.contextId ?? `v1-sctx-${v1Seq}`;
         res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+
+        if (prompt === "task-history-only") {
+          sseWrite(res, {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              task: {
+                id,
+                contextId: ctx,
+                status: { state: "TASK_STATE_COMPLETED" },
+                history: [{ messageId: "m-h1", role: "ROLE_AGENT", parts: [{ text: "history-only-answer" }] }],
+              },
+            },
+          });
+          return res.end();
+        }
+        if (prompt === "task-messages-only") {
+          sseWrite(res, {
+            jsonrpc: "2.0",
+            id: body.id,
+            result: {
+              task: {
+                id,
+                contextId: ctx,
+                status: { state: "TASK_STATE_COMPLETED" },
+                messages: [{ role: "agent", parts: [{ type: "text", text: "messages-only-answer" }] }],
+              },
+            },
+          });
+          return res.end();
+        }
 
         if (isSwival) {
           // Swival emits bare SSE events (no JSON-RPC wrapper, no final flag)
@@ -2023,6 +2058,24 @@ describe("A2A v1.0 protocol support", () => {
       ["message/stream", "SendStreamingMessage"],
     );
 
+    // Auto falls back on -32601 for getTask and cancelTask too
+    const autoWorking = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "start-working" });
+    v1Requests.length = 0;
+    const autoFetched = await getTask({ baseUrl: v1BaseUrl, taskId: autoWorking.taskId });
+    assert.equal(autoFetched.state, "working");
+    assert.deepEqual(
+      v1Requests.map((r) => r.rpcMethod),
+      ["tasks/get", "GetTask"],
+    );
+
+    v1Requests.length = 0;
+    const autoCanceled = await cancelTask({ baseUrl: v1BaseUrl, taskId: autoWorking.taskId });
+    assert.equal(autoCanceled.state, "canceled");
+    assert.deepEqual(
+      v1Requests.map((r) => r.rpcMethod),
+      ["tasks/cancel", "CancelTask"],
+    );
+
     // Auto does NOT retry non--32601 errors (e.g., 401 unauthorized or -32602 invalid params)
     v1Requests.length = 0;
     await assert.rejects(
@@ -2033,10 +2086,11 @@ describe("A2A v1.0 protocol support", () => {
 
     v1Requests.length = 0;
     await assert.rejects(
-      () => sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "trigger-invalid-params" }),
+      () => sendMessage({ baseUrl: v1BaseUrl, message: "trigger-invalid-params-auto" }),
       (err) => err instanceof A2AError && err.code === -32602,
     );
     assert.equal(v1Requests.length, 1);
+    assert.equal(v1Requests[0].rpcMethod, "message/send");
 
     // reply_withheld works in v1.0 too
     const withheld = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "trigger-withheld" });
@@ -2112,5 +2166,133 @@ describe("A2A v1.0 protocol support", () => {
     const okLegacy = await legacyV1Pi.tools.get("a2a_send").execute("v1-ok-1", { message: "via-env" });
     assert.notEqual(okLegacy.isError, true);
     assert.match(okLegacy.content[0].text, /v1:ROLE_USER:via-env/);
+  });
+
+  it("preserves origin pinning across mutable URL/options during fallback, handles history-only streaming Tasks, blocks observer/mid-stream retries, and enforces deadline exhaustion", async () => {
+    // 1. Mutating a caller-owned URL object while getAgentCard's v0.3 request is in flight cannot redirect fallback
+    const mutableUrl = new URL("https://safe.example");
+    /** @type {string[]} */
+    const cardSeenUrls = [];
+    const cardFetch = async (url) => {
+      cardSeenUrls.push(String(url));
+      if (cardSeenUrls.length === 1) {
+        mutableUrl.hostname = "evil.example";
+        return new Response("not found", { status: 404 });
+      }
+      return new Response(JSON.stringify({ name: "SafeV1", version: "1.0" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const pinnedCard = await getAgentCard({
+      baseUrl: mutableUrl,
+      pinnedOrigin: "https://safe.example",
+      headers: { authorization: "Bearer SECRET" },
+      fetchImpl: cardFetch,
+    });
+    assert.equal(pinnedCard.name, "SafeV1");
+    assert.deepEqual(cardSeenUrls, [
+      "https://safe.example/.well-known/agent.json",
+      "https://safe.example/.well-known/agent-card.json",
+    ]);
+
+    // 2. Mutating options.baseUrl while streaming fallback is in flight cannot redirect the v1 retry
+    /** @type {string[]} */
+    const streamSeenUrls = [];
+    const mutableOpts = {
+      baseUrl: "https://safe.example",
+      pinnedOrigin: "https://safe.example",
+      headers: { authorization: "Bearer SECRET" },
+      message: "hi",
+      stream: true,
+      fetchImpl: async (url) => {
+        streamSeenUrls.push(String(url));
+        if (streamSeenUrls.length === 1) {
+          mutableOpts.baseUrl = "https://evil.example";
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: "1", error: { code: -32601, message: "Method not found" } }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(
+          `data: ${JSON.stringify({ jsonrpc: "2.0", id: "2", result: { message: { role: "ROLE_AGENT", parts: [{ text: "ok" }] } } })}\n\n`,
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    };
+    const pinnedStream = await sendMessage(mutableOpts);
+    assert.equal(pinnedStream.text, "ok");
+    assert.deepEqual(streamSeenUrls, ["https://safe.example/", "https://safe.example/"]);
+
+    // 3. Streaming completed Task wrappers with history-only or messages-only answers preserve text
+    const histTask = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "task-history-only", stream: true });
+    assert.equal(histTask.state, "completed");
+    assert.equal(histTask.text, "history-only-answer");
+
+    const msgTask = await sendMessage({ baseUrl: v1BaseUrl, protocol: "1.0", message: "task-messages-only", stream: true });
+    assert.equal(msgTask.state, "completed");
+    assert.equal(msgTask.text, "messages-only-answer");
+
+    // 4. Observer onEvent throwing A2AError(-32601) after an accepted event never triggers a retry
+    let observerFetchCount = 0;
+    const observerFetch = async () => {
+      observerFetchCount += 1;
+      const body = `data: ${JSON.stringify({
+        jsonrpc: "2.0",
+        id: "1",
+        result: { kind: "status-update", taskId: "t1", status: { state: "working" }, final: false },
+      })}\n\n`;
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    await assert.rejects(
+      () =>
+        sendMessage({
+          baseUrl: "https://safe.example",
+          message: "hi",
+          stream: true,
+          fetchImpl: observerFetch,
+          onEvent: () => {
+            throw new A2AError("observer failure", { code: -32601 });
+          },
+        }),
+      (err) => err instanceof A2AError && err.message === "observer failure",
+    );
+    assert.equal(observerFetchCount, 1);
+
+    // 5. Remote mid-stream JSON-RPC -32601 after an accepted event never triggers a retry
+    let midStreamFetchCount = 0;
+    const midStreamFetch = async () => {
+      midStreamFetchCount += 1;
+      const body =
+        `data: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "1",
+          result: { kind: "status-update", taskId: "t1", status: { state: "working" }, final: false },
+        })}\n\n` +
+        `data: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "1",
+          error: { code: -32601, message: "late method error" },
+        })}\n\n`;
+      return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    };
+    await assert.rejects(
+      () => sendMessage({ baseUrl: "https://safe.example", message: "hi", stream: true, fetchImpl: midStreamFetch }),
+      (err) => err instanceof A2AError && err.code === -32601,
+    );
+    assert.equal(midStreamFetchCount, 1);
+
+    // 6. Exhausted timeout deadline rejects before starting a fallback request
+    let timeoutFetchCount = 0;
+    const slow404Fetch = async () => {
+      timeoutFetchCount += 1;
+      await new Promise((r) => setTimeout(r, 35));
+      return new Response("not found", { status: 404 });
+    };
+    await assert.rejects(
+      () => getAgentCard({ baseUrl: "https://safe.example", timeoutMs: 20, fetchImpl: slow404Fetch }),
+      (err) => err instanceof A2AError && /timed out/.test(err.message),
+    );
+    assert.equal(timeoutFetchCount, 1);
   });
 });
