@@ -26,6 +26,20 @@ export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export const PROTOCOL_VERSIONS = Object.freeze(["auto", "0.3", "1.0"]);
 export const DEFAULT_PROTOCOL = "auto";
+export const A2A_VERSION_HEADER = "a2a-version";
+
+/** Canonical A2A v1.0 JSON-RPC error code mappings (spec §5.4). */
+export const A2A_ERROR_CODES = Object.freeze({
+  TASK_NOT_FOUND: -32001,
+  TASK_NOT_CANCELABLE: -32002,
+  PUSH_NOTIFICATION_NOT_SUPPORTED: -32003,
+  UNSUPPORTED_OPERATION: -32004,
+  CONTENT_TYPE_NOT_SUPPORTED: -32005,
+  INVALID_AGENT_RESPONSE: -32006,
+  EXTENDED_AGENT_CARD_NOT_CONFIGURED: -32007,
+  EXTENSION_SUPPORT_REQUIRED: -32008,
+  VERSION_NOT_SUPPORTED: -32009,
+});
 
 const PROTOCOL_SET = Object.freeze(new Set(PROTOCOL_VERSIONS));
 
@@ -180,16 +194,21 @@ function isAgentRole(role) {
   return role === "agent" || role === "ROLE_AGENT";
 }
 
-const REMOTE_METHOD_NOT_FOUND = Symbol("remoteMethodNotFound");
+const REMOTE_PROTOCOL_FALLBACK = Symbol("remoteProtocolFallback");
 
 /**
- * Returns true when an error is a remote JSON-RPC -32601 Method not found rejection
- * (never an observer/callback exception or an error thrown after stream events were accepted).
+ * Returns true when an error is a remote JSON-RPC -32601 (Method not found) or
+ * -32009 (VersionNotSupportedError) rejection before execution — never an observer/callback
+ * exception or an error thrown after stream events were accepted.
  *
  * @param {unknown} err
  */
-function isRetryableMethodNotFound(err) {
-  return err instanceof A2AError && err.code === -32601 && /** @type {any} */ (err)[REMOTE_METHOD_NOT_FOUND] === true;
+function isRetryableProtocolFallback(err) {
+  return (
+    err instanceof A2AError &&
+    (err.code === -32601 || err.code === A2A_ERROR_CODES.VERSION_NOT_SUPPORTED) &&
+    /** @type {any} */ (err)[REMOTE_PROTOCOL_FALLBACK] === true
+  );
 }
 
 /**
@@ -523,8 +542,8 @@ function rpcError(error, status, { allowMethodFallback = true } = {}) {
     status,
     reason,
   });
-  if (allowMethodFallback && error.code === -32601) {
-    /** @type {any} */ (err)[REMOTE_METHOD_NOT_FOUND] = true;
+  if (allowMethodFallback && (error.code === -32601 || error.code === A2A_ERROR_CODES.VERSION_NOT_SUPPORTED)) {
+    /** @type {any} */ (err)[REMOTE_PROTOCOL_FALLBACK] = true;
   }
   return err;
 }
@@ -538,6 +557,8 @@ function rpcError(error, status, { allowMethodFallback = true } = {}) {
  * @param {{
  *   baseUrl: string | URL;
  *   agent?: string;
+ *   pinnedOrigin?: string | URL;
+ *   protocolVersion?: "0.3" | "1.0";
  *   method: string;
  *   params: unknown;
  *   headers?: Record<string, string>;
@@ -555,6 +576,7 @@ export async function rpcCall(options) {
   const headers = mergeHeaders(options.headers, {
     "content-type": "application/json",
     accept: "application/json",
+    ...(options.protocolVersion === "1.0" ? { [A2A_VERSION_HEADER]: "1.0" } : {}),
   });
   const { status, text } = await fetchCapped(url, {
     method: "POST",
@@ -1234,6 +1256,7 @@ export async function sendMessage(options) {
       baseUrl,
       agent,
       pinnedOrigin,
+      protocolVersion: wireVersion,
       method: RPC_METHODS[wireVersion].send,
       params,
       headers: headersSnapshot,
@@ -1248,7 +1271,7 @@ export async function sendMessage(options) {
     try {
       return await attempt(initialVersion);
     } catch (err) {
-      if (protocol === "auto" && initialVersion === "0.3" && isRetryableMethodNotFound(err) && !signal?.aborted) {
+      if (protocol === "auto" && initialVersion === "0.3" && isRetryableProtocolFallback(err) && !signal?.aborted) {
         return await attempt("1.0");
       }
       throw err;
@@ -1293,6 +1316,7 @@ async function streamMessage(options, params, wireVersion) {
   const headers = mergeHeaders(options.headers, {
     "content-type": "application/json",
     accept: "text/event-stream",
+    ...(wireVersion === "1.0" ? { [A2A_VERSION_HEADER]: "1.0" } : {}),
   });
   const { signal, cleanup } = withTimeout(options.signal, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -1399,6 +1423,7 @@ async function streamMessage(options, params, wireVersion) {
       if (result.contextId) contextId = result.contextId;
 
       if (kind === "status-update" || kind === "task") {
+        const prevState = state;
         const newState =
           typeof result.status?.state === "string" ? normalizeTaskState(result.status.state) : state;
         state = newState;
@@ -1414,7 +1439,7 @@ async function streamMessage(options, params, wireVersion) {
           }
           frameHistoryText = latestAgentHistoryText(result);
           if (frameHistoryText) historyText = frameHistoryText;
-        } else if (text) {
+        } else if (text || newState !== prevState || result.final === true) {
           statusText = text;
         }
         options.onEvent?.({
@@ -1500,6 +1525,7 @@ export async function getTask(baseUrlOrOptions, maybeOptions) {
       baseUrl,
       agent,
       pinnedOrigin,
+      protocolVersion: wireVersion,
       method: RPC_METHODS[wireVersion].getTask,
       params,
       headers: headersSnapshot,
@@ -1512,7 +1538,7 @@ export async function getTask(baseUrlOrOptions, maybeOptions) {
   try {
     result = await call(initialVersion);
   } catch (err) {
-    if (protocol === "auto" && initialVersion === "0.3" && isRetryableMethodNotFound(err) && !signal?.aborted) {
+    if (protocol === "auto" && initialVersion === "0.3" && isRetryableProtocolFallback(err) && !signal?.aborted) {
       result = await call("1.0");
     } else {
       throw err;
@@ -1556,6 +1582,7 @@ export async function cancelTask(baseUrlOrOptions, maybeOptions) {
       baseUrl,
       agent,
       pinnedOrigin,
+      protocolVersion: wireVersion,
       method: RPC_METHODS[wireVersion].cancelTask,
       params,
       headers: headersSnapshot,
@@ -1568,7 +1595,7 @@ export async function cancelTask(baseUrlOrOptions, maybeOptions) {
   try {
     result = await call(initialVersion);
   } catch (err) {
-    if (protocol === "auto" && initialVersion === "0.3" && isRetryableMethodNotFound(err) && !signal?.aborted) {
+    if (protocol === "auto" && initialVersion === "0.3" && isRetryableProtocolFallback(err) && !signal?.aborted) {
       result = await call("1.0");
     } else {
       throw err;

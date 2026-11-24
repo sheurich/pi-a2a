@@ -20,7 +20,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/a2a.test.mjs"
+    "test": "node --test test/a2a.test.mjs test/a2a-spec-conformance.test.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

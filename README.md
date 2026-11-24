@@ -66,7 +66,7 @@ Gateway config rules and security invariants:
 - **File trust checks:** Config files are opened non-blockingly (`O_RDONLY | O_NONBLOCK` → `fstat` → bounded 64 KiB `read`) to avoid TOCTOU races and FIFO hangs. Non-regular files are rejected; on POSIX, the resolved file must be owned by the current user and not group- or world-writable (`mode & 0o022`). (Parent directory permissions are not checked, and mode/ownership checks are skipped on Windows.) An explicit `PI_A2A_CONFIG` must be an absolute path and fails closed if missing or invalid; a dangling symlink at the default `~/.pi/agent/a2a.json` path behaves as absent (`ENOENT`).
 - **Executable path safety:** Relative `headersHelper` executables containing `/` or `\` are rejected (use absolute paths or bare `PATH` command names), and named-gateway helpers execute with `cwd` set to the config file's directory (or `$HOME` for programmatic gateways) rather than the active project working directory.
 - **Credential & origin isolation:** Named gateways never inherit `PI_A2A_URL`, `PI_A2A_HEADERS_HELPER`, `PI_A2A_AGENT`, or `PI_A2A_PROTOCOL`. Passing a different `url` alongside a named gateway (even same-origin with a different path) is refused, and `pinnedOrigin` is always enforced at the client layer.
-- **A2A v0.3 & v1.0 wire compatibility:** `"0.3"` uses `/.well-known/agent.json` and `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`. `"1.0"` uses `/.well-known/agent-card.json`, `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `role: "ROLE_USER"`, and `{ text }` parts. `"auto"` (default) tries v0.3 first and falls back to v1.0 only on HTTP 404/405 for Agent Cards or JSON-RPC `-32601` (Method not found) for RPC calls. Response and SSE normalization transparently accepts v0.3 payloads, v1.0 `TASK_STATE_*` / `ROLE_AGENT` / union-wrapped (`task`, `message`, `statusUpdate`, `artifactUpdate`) payloads, and bare Swival SSE event frames.
+- **A2A v0.3 & v1.0 wire compatibility:** `"0.3"` uses `/.well-known/agent.json` and `message/send`, `message/stream`, `tasks/get`, `tasks/cancel` (omitting `A2A-Version`, which spec §3.6 defines as `0.3`). `"1.0"` uses `/.well-known/agent-card.json`, sends `A2A-Version: 1.0`, and uses `SendMessage`, `SendStreamingMessage`, `GetTask`, `CancelTask`, `role: "ROLE_USER"`, and `{ text }` parts. `"auto"` (default) tries v0.3 first and falls back to v1.0 only on HTTP 404/405 for Agent Cards or JSON-RPC `-32601` (Method not found) / `-32009` (`VersionNotSupportedError`) before execution for RPC calls. Response and SSE normalization transparently accepts v0.3 payloads, v1.0 `TASK_STATE_*` / `ROLE_AGENT` / union-wrapped (`task`, `message`, `statusUpdate`, `artifactUpdate`) payloads, and bare Swival SSE event frames.
 - **Precedence when `gateway` is omitted:** `options.gateway` → `options.baseUrl` → `PI_A2A_GATEWAY` → `PI_A2A_URL` → `a2a.json` `defaultGateway` → ad-hoc `url` (only when no legacy `headersHelper` is configured). This keeps existing `PI_A2A_URL` setups unchanged when `a2a.json` is added.
 - **Multi-gateway reach tradeoff:** Any gateway listed in `a2a.json` is reachable by the model via `gateway: "<name>"` (and can invoke that gateway's `headersHelper`). Only configure gateways you intend the active Pi session to reach.
 
@@ -138,10 +138,10 @@ console.log(reply.state, reply.text);
 ## Development
 
 ```sh
-node --test test/a2a.test.mjs
+npm test
 ```
 
-The test suite spins up a loopback mock gateway with `node:http` and covers Agent Card discovery, `message/send`, `message/stream` SSE parsing, `input-required` continuation via `a2a_reply`, `tasks/get` and `tasks/cancel`, `reply_withheld` handling, and the headers helper allowlist and redaction. It runs offline and needs no `node_modules`.
+The test suite spins up loopback mock gateways with `node:http` and includes both `test/a2a.test.mjs` (unit & extension tests) and `test/a2a-spec-conformance.test.mjs` (A2A v1.0 specification conformance suite pinned to `a2aproject/A2A@5f931b8a`, covering §3.6 `A2A-Version` negotiation, §5.4 error codes `-32001..-32009`, §9 JSON-RPC/SSE bindings, and §4 data model enums). It runs offline and needs no `node_modules`.
 
 Layout:
 
