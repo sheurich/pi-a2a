@@ -22,6 +22,7 @@
  *                          `Header: value` lines on stdout)
  * - PI_A2A_AGENT           optional default agent name for legacy single-gateway mode
  * - PI_A2A_PROTOCOL        optional wire protocol (`auto`, `0.3`, or `1.0`) for legacy mode
+ * - PI_A2A_TIMEOUT_MS      optional default request timeout in milliseconds (1–3600000)
  *
  * Header values and helper commands are never accepted from tool parameters, so
  * the model cannot inject credentials or run arbitrary helper commands.
@@ -30,12 +31,16 @@
 import { dirname } from "node:path";
 
 import {
+  DEFAULT_STREAM_TIMEOUT_MS,
+  DEFAULT_TIMEOUT_MS,
+  MAX_TIMEOUT_MS,
   cancelTask,
   discoverAgents,
   getAgentCard,
   getFile,
   getTask,
   normalizeProtocol,
+  normalizeTimeoutMs,
   sendFile,
   sendMessage,
   A2AError,
@@ -56,6 +61,7 @@ export const ENV_URL = "PI_A2A_URL";
 export const ENV_HEADERS_HELPER = "PI_A2A_HEADERS_HELPER";
 export const ENV_AGENT = "PI_A2A_AGENT";
 export const ENV_PROTOCOL = "PI_A2A_PROTOCOL";
+export const ENV_TIMEOUT_MS = "PI_A2A_TIMEOUT_MS";
 export { ENV_CONFIG, ENV_GATEWAY, GATEWAY_NAME_PATTERN, MAX_CONFIG_BYTES, loadGatewayConfig, validateGatewayConfig };
 
 /**
@@ -70,6 +76,7 @@ export { ENV_CONFIG, ENV_GATEWAY, GATEWAY_NAME_PATTERN, MAX_CONFIG_BYTES, loadGa
  *   headersHelper?: string | string[];
  *   agent?: string;
  *   protocol?: "auto" | "0.3" | "1.0";
+ *   timeoutMs?: number;
  *   gateway?: string;
  *   gateways?: Record<string, GatewayInput>;
  *   env?: NodeJS.ProcessEnv;
@@ -89,6 +96,7 @@ export function readConfig(env = process.env) {
     headersHelper: trim(env[ENV_HEADERS_HELPER]),
     agent: trim(env[ENV_AGENT]),
     protocol: trim(env[ENV_PROTOCOL]),
+    timeoutMs: trim(env[ENV_TIMEOUT_MS]),
     configPath: trim(env[ENV_CONFIG]),
     gateway: trim(env[ENV_GATEWAY]),
   };
@@ -115,6 +123,12 @@ const contextIdProperty = { type: "string", description: "Optional contextId to 
 const streamProperty = {
   type: "boolean",
   description: "Use streaming (message/stream or SendStreamingMessage over SSE) instead of a blocking request. Default false.",
+};
+const timeoutMsProperty = {
+  type: "integer",
+  minimum: 1,
+  maximum: MAX_TIMEOUT_MS,
+  description: `Optional request timeout in milliseconds (1–${MAX_TIMEOUT_MS}). Overrides ${ENV_TIMEOUT_MS} and the default (${DEFAULT_TIMEOUT_MS} ms blocking, ${DEFAULT_STREAM_TIMEOUT_MS} ms streaming).`,
 };
 
 /**
@@ -564,6 +578,26 @@ export default function registerPiA2aExtension(pi, options = {}) {
   }
 
   /**
+   * Resolves the effective request timeout: tool `timeout_ms` → programmatic `options.timeoutMs` → `PI_A2A_TIMEOUT_MS` → `undefined` (client default).
+   *
+   * @param {unknown} paramTimeoutMs
+   * @returns {number | undefined}
+   */
+  function resolveTimeoutMs(paramTimeoutMs) {
+    if (paramTimeoutMs !== undefined) {
+      return normalizeTimeoutMs(/** @type {number | string} */ (paramTimeoutMs), undefined);
+    }
+    if (options.timeoutMs !== undefined) {
+      return normalizeTimeoutMs(options.timeoutMs, undefined);
+    }
+    const envTimeout = readConfig(env).timeoutMs;
+    if (envTimeout !== undefined) {
+      return normalizeTimeoutMs(envTimeout, undefined);
+    }
+    return undefined;
+  }
+
+  /**
    * Handles `/a2a` slash commands.
    *
    * @param {string | undefined} args
@@ -586,7 +620,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
         const summary = await getAgentCard({ ...conn });
         return { text: formatCard(summary, conn.gateway), details: { ...(conn.gateway ? { gateway: conn.gateway } : {}), ...summary } };
       }
-      const sent = await sendMessage({ ...conn, message: parsed.message });
+      const sent = await sendMessage({ ...conn, message: parsed.message, timeoutMs: resolveTimeoutMs(undefined) });
       return { text: formatResult(sent, "A2A message sent", conn.gateway), details: { ...(conn.gateway ? { gateway: conn.gateway } : {}), ...sent } };
     });
     notify(result.content[0].text, result.isError ? "error" : "info");
@@ -824,6 +858,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
         url: urlProperty,
         context_id: contextIdProperty,
         stream: streamProperty,
+        timeout_ms: timeoutMsProperty,
       },
       required: ["message"],
       additionalProperties: false,
@@ -836,6 +871,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
           message: params.message,
           contextId: params.context_id,
           stream: Boolean(params.stream),
+          timeoutMs: resolveTimeoutMs(params.timeout_ms),
           signal,
           onEvent: (event) => {
             if (!onUpdate) return;
@@ -886,6 +922,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
         url: urlProperty,
         context_id: contextIdProperty,
         stream: streamProperty,
+        timeout_ms: timeoutMsProperty,
       },
       required: ["task_id", "message"],
       additionalProperties: false,
@@ -899,6 +936,7 @@ export default function registerPiA2aExtension(pi, options = {}) {
           taskId: params.task_id,
           contextId: params.context_id,
           stream: Boolean(params.stream),
+          timeoutMs: resolveTimeoutMs(params.timeout_ms),
           signal,
           onEvent: (event) => {
             if (!onUpdate) return;

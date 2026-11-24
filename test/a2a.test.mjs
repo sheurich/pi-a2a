@@ -11,7 +11,10 @@ import {
   A2AError,
   AGENT_CARD_PATH,
   AGENT_CARD_V1_PATH,
+  DEFAULT_STREAM_TIMEOUT_MS,
+  DEFAULT_TIMEOUT_MS,
   MAX_AGENT_CARD_BYTES,
+  MAX_TIMEOUT_MS,
   assertAllowedBaseUrl,
   buildAgentUrl,
   buildMessageParams,
@@ -26,6 +29,7 @@ import {
   normalizeProtocol,
   normalizeResult,
   normalizeTaskState,
+  normalizeTimeoutMs,
   parseSseStream,
   sendMessage,
 } from "../src/client.mjs";
@@ -38,6 +42,7 @@ import {
   validateAndNormalizeHeaders,
 } from "../src/headers-helper.mjs";
 import registerPiA2aExtension, {
+  ENV_TIMEOUT_MS,
   MAX_CONFIG_BYTES,
   loadGatewayConfig,
   parseSlashArgs,
@@ -2460,3 +2465,78 @@ describe("A2A v1.0 protocol support", () => {
     assert.equal(sendTimeoutCount, 1);
   });
 });
+
+describe("Request timeout configuration", () => {
+  it("exports distinct blocking and streaming defaults and validates timeout bounds", () => {
+    assert.equal(DEFAULT_TIMEOUT_MS, 60_000);
+    assert.equal(DEFAULT_STREAM_TIMEOUT_MS, 600_000);
+    assert.equal(MAX_TIMEOUT_MS, 3_600_000);
+    assert.equal(ENV_TIMEOUT_MS, "PI_A2A_TIMEOUT_MS");
+
+    assert.equal(normalizeTimeoutMs(undefined, 1234), 1234);
+    assert.equal(normalizeTimeoutMs(null, 1234), 1234);
+    assert.equal(normalizeTimeoutMs("  ", 1234), 1234);
+    assert.equal(normalizeTimeoutMs(45_000, 1234), 45_000);
+    assert.equal(normalizeTimeoutMs("420000", 1234), 420_000);
+    assert.equal(normalizeTimeoutMs(MAX_TIMEOUT_MS, 1234), MAX_TIMEOUT_MS);
+
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_TIMEOUT_MS + 1, "0", "-5", "60s", "1e3", {}]) {
+      assert.throws(() => normalizeTimeoutMs(/** @type {any} */ (bad), 1234), (err) => err instanceof A2AError);
+    }
+  });
+
+  it("supports timeout_ms tool parameter and PI_A2A_TIMEOUT_MS env override on a2a_send and a2a_reply", async () => {
+    const hangingFetch = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal.reason ?? new Error("aborted")));
+      });
+
+    const register = (env) => {
+      /** @type {Map<string, any>} */
+      const tools = new Map();
+      registerPiA2aExtension(
+        {
+          registerTool: (def) => tools.set(def.name, def),
+          registerCommand: () => {},
+        },
+        {
+          baseUrl: "https://timeout.example",
+          protocol: "1.0",
+          env,
+          fetchImpl: /** @type {typeof fetch} */ (hangingFetch),
+        },
+      );
+      return tools;
+    };
+
+    // 1. Env override applies when tool parameter is omitted
+    const envTools = register({ PI_A2A_TIMEOUT_MS: "25" });
+    const envRes = await envTools.get("a2a_send").execute("id1", { message: "hi", stream: true });
+    assert.equal(envRes.isError, true);
+    assert.match(envRes.content[0].text, /A2A request timed out after 25 ms/);
+
+    // 2. Explicit timeout_ms overrides PI_A2A_TIMEOUT_MS on both a2a_send and a2a_reply
+    const sendRes = await envTools.get("a2a_send").execute("id2", { message: "hi", stream: true, timeout_ms: 40 });
+    assert.equal(sendRes.isError, true);
+    assert.match(sendRes.content[0].text, /A2A request timed out after 40 ms/);
+
+    const replyRes = await envTools
+      .get("a2a_reply")
+      .execute("id3", { task_id: "task-1", message: "more", stream: true, timeout_ms: 35 });
+    assert.equal(replyRes.isError, true);
+    assert.match(replyRes.content[0].text, /A2A request timed out after 35 ms/);
+
+    // 3. Invalid timeout_ms or PI_A2A_TIMEOUT_MS fails closed
+    const badParam = await envTools.get("a2a_send").execute("id4", { message: "hi", timeout_ms: 0 });
+    assert.equal(badParam.isError, true);
+    assert.match(badParam.content[0].text, /Invalid timeout_ms/);
+
+    const badEnvTools = register({ PI_A2A_TIMEOUT_MS: "not-a-number" });
+    const badEnv = await badEnvTools.get("a2a_send").execute("id5", { message: "hi" });
+    assert.equal(badEnv.isError, true);
+    assert.match(badEnv.content[0].text, /Invalid timeout_ms/);
+
+    assert.equal(readConfig({ PI_A2A_TIMEOUT_MS: " 420000 " }).timeoutMs, "420000");
+  });
+});
+

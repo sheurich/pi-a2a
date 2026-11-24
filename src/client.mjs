@@ -23,6 +23,37 @@ export const MAX_SSE_BYTES = 4 * 1024 * 1024;
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 export const FILES_PATH = "/files";
 export const DEFAULT_TIMEOUT_MS = 60_000;
+export const DEFAULT_STREAM_TIMEOUT_MS = 600_000;
+export const MAX_TIMEOUT_MS = 3_600_000;
+
+/**
+ * Normalizes and validates an optional timeout in milliseconds.
+ *
+ * @template {number | undefined} T
+ * @param {number | string | null | undefined} value
+ * @param {T} fallback
+ * @returns {number | T}
+ */
+export function normalizeTimeoutMs(value, fallback) {
+  if (value === undefined || value === null) return fallback;
+  let num;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    if (!/^\d+$/.test(trimmed)) {
+      throw new A2AError(`Invalid timeout_ms: expected an integer between 1 and ${MAX_TIMEOUT_MS}`);
+    }
+    num = Number(trimmed);
+  } else if (typeof value === "number") {
+    num = value;
+  } else {
+    throw new A2AError(`Invalid timeout_ms: expected an integer between 1 and ${MAX_TIMEOUT_MS}`);
+  }
+  if (!Number.isInteger(num) || num < 1 || num > MAX_TIMEOUT_MS) {
+    throw new A2AError(`Invalid timeout_ms: expected an integer between 1 and ${MAX_TIMEOUT_MS}`);
+  }
+  return num;
+}
 
 export const PROTOCOL_VERSIONS = Object.freeze(["auto", "0.3", "1.0"]);
 export const DEFAULT_PROTOCOL = "auto";
@@ -1232,7 +1263,9 @@ export async function sendMessage(options) {
   const agent = normalizeAgent(options.agent);
   const protocol = normalizeProtocol(options.protocol) ?? DEFAULT_PROTOCOL;
   const initialVersion = protocol === "1.0" ? "1.0" : "0.3";
-  const totalTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const stream = Boolean(options.stream);
+  const defaultTimeoutMs = stream ? DEFAULT_STREAM_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+  const totalTimeoutMs = normalizeTimeoutMs(options.timeoutMs, defaultTimeoutMs);
   const deadline = Date.now() + totalTimeoutMs;
   const messageSnapshot = {
     message: options.message,
@@ -1242,7 +1275,6 @@ export async function sendMessage(options) {
     metadata: options.metadata,
   };
   const headersSnapshot = options.headers ? { ...options.headers } : undefined;
-  const stream = Boolean(options.stream);
   const signal = options.signal;
   const onEvent = options.onEvent;
   const fetchImpl = options.fetchImpl;
@@ -1339,7 +1371,7 @@ async function streamMessage(options, params, wireVersion) {
     }),
     wireVersion,
   );
-  const { signal, cleanup } = withTimeout(options.signal, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const { signal, cleanup } = withTimeout(options.signal, normalizeTimeoutMs(options.timeoutMs, DEFAULT_STREAM_TIMEOUT_MS));
   const fetchImpl = options.fetchImpl ?? fetch;
 
   /** @type {unknown[]} */

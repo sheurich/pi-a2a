@@ -34,6 +34,7 @@ Then configure one or more gateways via a user-level JSON config file (`~/.pi/ag
 | `PI_A2A_HEADERS_HELPER` | no | Command that prints authentication headers to stdout for legacy `PI_A2A_URL` mode, either as a JSON object or as `Header: value` lines. Run with `execFile` (no shell), a 10 s timeout, and a 64 KiB output cap. Only `authorization` and `x-goog-iap-jwt-assertion` are accepted. |
 | `PI_A2A_AGENT` | no | Default agent name used in legacy `PI_A2A_URL` mode when a tool call does not specify one. |
 | `PI_A2A_PROTOCOL` | no | Wire protocol for legacy `PI_A2A_URL` mode: `auto` (default), `0.3`, or `1.0`. Named gateways configure `protocol` per entry and do not inherit this variable. |
+| `PI_A2A_TIMEOUT_MS` | no | Default request timeout in milliseconds (`1`–`3600000`) for `a2a_send`, `a2a_reply`, and `/a2a`. Overrides the built-in defaults (`60000` ms blocking, `600000` ms streaming); overridden per call by `timeout_ms`. |
 
 \* The model may also pass `gateway` (targeting a configured named gateway) or `url` per call (when no legacy `headersHelper` is configured); every URL still has to satisfy the HTTPS/loopback rule.
 

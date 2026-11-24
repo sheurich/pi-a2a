@@ -92,6 +92,8 @@ export interface PiA2aOptions {
   agent?: string;
   /** Overrides PI_A2A_PROTOCOL for legacy/ad-hoc calls. */
   protocol?: ProtocolVersion;
+  /** Overrides PI_A2A_TIMEOUT_MS (request timeout in milliseconds, 1–3600000). */
+  timeoutMs?: number;
   /** Default named gateway to target when `gateway` is omitted. */
   gateway?: string;
   /** Programmatic named gateway registry (replaces config file loading). */
@@ -116,6 +118,7 @@ export const ENV_URL: "PI_A2A_URL";
 export const ENV_HEADERS_HELPER: "PI_A2A_HEADERS_HELPER";
 export const ENV_AGENT: "PI_A2A_AGENT";
 export const ENV_PROTOCOL: "PI_A2A_PROTOCOL";
+export const ENV_TIMEOUT_MS: "PI_A2A_TIMEOUT_MS";
 export const ENV_CONFIG: "PI_A2A_CONFIG";
 export const ENV_GATEWAY: "PI_A2A_GATEWAY";
 export const GATEWAY_NAME_PATTERN: RegExp;
@@ -126,6 +129,7 @@ export function readConfig(env?: NodeJS.ProcessEnv): {
   headersHelper: string | undefined;
   agent: string | undefined;
   protocol: string | undefined;
+  timeoutMs: string | undefined;
   configPath: string | undefined;
   gateway: string | undefined;
 };
