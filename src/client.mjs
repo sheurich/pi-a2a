@@ -531,7 +531,7 @@ export function isReplyWithheld(input) {
  * @param {{ code?: number; message?: string; data?: unknown }} error
  * @param {number} [status]
  */
-function rpcError(error, status, { allowMethodFallback = true } = {}) {
+function rpcError(error, status, { allowProtocolFallback = true } = {}) {
   const reason =
     error.data && typeof error.data === "object" && typeof (/** @type {any} */ (error.data).reason) === "string"
       ? /** @type {any} */ (error.data).reason
@@ -542,10 +542,27 @@ function rpcError(error, status, { allowMethodFallback = true } = {}) {
     status,
     reason,
   });
-  if (allowMethodFallback && (error.code === -32601 || error.code === A2A_ERROR_CODES.VERSION_NOT_SUPPORTED)) {
+  if (allowProtocolFallback && (error.code === -32601 || error.code === A2A_ERROR_CODES.VERSION_NOT_SUPPORTED)) {
     /** @type {any} */ (err)[REMOTE_PROTOCOL_FALLBACK] = true;
   }
   return err;
+}
+
+/**
+ * Enforces the authoritative `A2A-Version` HTTP header for the selected wire version
+ * after merging caller headers (spec §3.6: `1.0` for v1.0; omitted for v0.3).
+ *
+ * @param {Record<string, string>} headers
+ * @param {"0.3" | "1.0" | undefined} protocolVersion
+ * @returns {Record<string, string>}
+ */
+function applyProtocolVersionHeader(headers, protocolVersion) {
+  if (protocolVersion === "1.0") {
+    headers[A2A_VERSION_HEADER] = "1.0";
+  } else if (protocolVersion === "0.3") {
+    delete headers[A2A_VERSION_HEADER];
+  }
+  return headers;
 }
 
 /**
@@ -573,11 +590,13 @@ export async function rpcCall(options) {
   const url = buildRpcUrl(options.baseUrl, options.agent);
   const id = newId();
   const body = JSON.stringify({ jsonrpc: "2.0", id, method: options.method, params: options.params });
-  const headers = mergeHeaders(options.headers, {
-    "content-type": "application/json",
-    accept: "application/json",
-    ...(options.protocolVersion === "1.0" ? { [A2A_VERSION_HEADER]: "1.0" } : {}),
-  });
+  const headers = applyProtocolVersionHeader(
+    mergeHeaders(options.headers, {
+      "content-type": "application/json",
+      accept: "application/json",
+    }),
+    options.protocolVersion,
+  );
   const { status, text } = await fetchCapped(url, {
     method: "POST",
     headers,
@@ -1313,11 +1332,13 @@ async function streamMessage(options, params, wireVersion) {
   const url = buildRpcUrl(options.baseUrl, options.agent);
   const id = newId();
   const body = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-  const headers = mergeHeaders(options.headers, {
-    "content-type": "application/json",
-    accept: "text/event-stream",
-    ...(wireVersion === "1.0" ? { [A2A_VERSION_HEADER]: "1.0" } : {}),
-  });
+  const headers = applyProtocolVersionHeader(
+    mergeHeaders(options.headers, {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+    }),
+    wireVersion,
+  );
   const { signal, cleanup } = withTimeout(options.signal, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const fetchImpl = options.fetchImpl ?? fetch;
 
@@ -1383,7 +1404,7 @@ async function streamMessage(options, params, wireVersion) {
       }
       const envelope = /** @type {any} */ (parsed);
       if (envelope?.error) {
-        const err = rpcError(envelope.error, response.status, { allowMethodFallback: true });
+        const err = rpcError(envelope.error, response.status, { allowProtocolFallback: true });
         if (err.reason === REPLY_WITHHELD) return withheld(err.message, err.data ?? null);
         throw err;
       }
@@ -1408,7 +1429,7 @@ async function streamMessage(options, params, wireVersion) {
       }
       events.push(envelope);
       if (envelope?.error) {
-        const err = rpcError(envelope.error, response.status, { allowMethodFallback: emittedCount === 0 });
+        const err = rpcError(envelope.error, response.status, { allowProtocolFallback: emittedCount === 0 });
         if (err.reason === REPLY_WITHHELD) return withheld(err.message, err.data ?? null);
         throw err;
       }
@@ -1439,7 +1460,7 @@ async function streamMessage(options, params, wireVersion) {
           }
           frameHistoryText = latestAgentHistoryText(result);
           if (frameHistoryText) historyText = frameHistoryText;
-        } else if (text || newState !== prevState || result.final === true) {
+        } else if (text || newState !== prevState) {
           statusText = text;
         }
         options.onEvent?.({
